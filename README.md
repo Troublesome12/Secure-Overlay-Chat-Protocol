@@ -19,7 +19,7 @@ This project implements the class Secure Overlay Chat Protocol (SOCP) using Pyth
 - **Client**: users attach to one local server; DMs are **E2E encrypted** (AES‑256‑GCM; RSA‑OAEP key wrap) and **content‑signed** (RSA‑PSS).
 - **Security**: RSA‑4096, SHA‑256, base64url (no padding), canonical JSON signing.
 
-## 📦 Project Tree
+## Project Tree
 ```
 SOCP
 ├── src                               
@@ -31,7 +31,7 @@ SOCP
 │    ├── server.py              # mesh server (Master/Local)
 │    ├── protocols.py           # protocol constants
 │    └── main.py                # CLI entrypoint
-├── clean.sh
+├── clean.sh                    # Command line file to clean the enviornment
 ├── README.md
 ├── DESIGN.md
 └── requirements.txt
