@@ -31,11 +31,16 @@ find src -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || tru
 find src -name '*.pyc' -delete 2>/dev/null || true
 
 # Reset runtime data (keep master identity)
-rm -f data/master_db.json
 rm -f keys/server.uuid
 rm -f keys/server_*.pem 2>/dev/null || true
 rm -f keys/Alice.pem keys/Bob.pem 2>/dev/null || true
-rm -rf downloads   
+rm -rf \
+  .pytest_cache \
+  .mypy_cache \
+  .ruff_cache \
+  .DS_Store \
+  downloads \
+  data
 
 # Optional: nuke master identity too
 if [[ "$NUKE" == "--nuke-master" ]]; then
