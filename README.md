@@ -10,8 +10,8 @@ This project implements the class Secure Overlay Chat Protocol (SOCP) using Pyth
 - **Sk Md Shariful Islam Arafat** - a1983627 
 - **Aditya Dixit** - a1980937  
 - **Hasnain Habib Sayed** - a1988079  
-- **Name 4** - Student ID
-- **Name 5** - Student ID 
+- **Sukarna Paul** - a1986887
+- **Atiq Ullah Ador** - a1989573 
 
 ## Features
 - **Server (mesh peer)**: `server_uuid`, presence gossip (`USER_ADVERTISE`/`USER_REMOVE`), DM routing (`PEER_DELIVER`/`USER_DELIVER`), error frames.
