@@ -27,6 +27,7 @@ CHANNEL_PUBLIC = "public"
 
 # Optional: public presence broadcast (server->user for UI); not required for basic post delivery.
 T_PUBLIC_INFO      = "PUBLIC_INFO"      # (optional UI hints, not used in routing)
+T_HEARTBEAT        = "HEARTBEAT"
 
 # --- Files (unchanged) ---
 T_FILE_START       = "FILE_START"

@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 from encoding import b64u_encode, b64u_decode
 
 """
-SOCP Client (v1.1)
+SOCP Client (v1.3)
 
 - Connects to one local server over WebSocket
 - Sends USER_HELLO on connect
@@ -46,7 +46,7 @@ class SOCPClient:
         self.keyring: dict[str,str] = {self.user_uuid: self.keys.pub_der_b64u()}
         self.recv_files: dict[str, dict] = {}       # file_id -> {"fh": f, "path": Path, "mode": str, "group_id": str|None}
         self.ws: websockets.WebSocketClientProtocol | None = None
-
+        self._send_lock = asyncio.Lock()
 
     async def run(self) -> None:
         """Connects to the server, sends USER_HELLO, and runs receiver + REPL"""
@@ -69,9 +69,10 @@ class SOCPClient:
             await ws.send(json.dumps(hello, separators=(',',':')))
             consumer = asyncio.create_task(self._recv())
             producer = asyncio.create_task(self._stdin()) if sys.stdin and sys.stdin.isatty() else None
+            hb = asyncio.create_task(self._heartbeat())
 
             await self.ws.wait_closed()   # stay alive until /quit or server closes
-            for t in (consumer, producer) if producer else (consumer,): t.cancel()
+            for t in (consumer, producer, hb) if producer else (consumer, hb): t.cancel()
 
     async def _recv(self) -> None:
         """Receives and processes server frames (USER_DELIVER / USER_DB_USER / ERROR)
@@ -167,19 +168,28 @@ class SOCPClient:
         assert self.ws
         loop = asyncio.get_event_loop()
         print("/help for commands")
+
         while self.ws and self.ws.open:
             try:
                 line = await loop.run_in_executor(None, input)
             except Exception:
                 await asyncio.sleep(0.2)
                 continue
-            
-            line = (line or "").strip()
-            if not line: continue
-            
+
+            if not line:
+                continue
+            line = line.strip()
+
+            # Require commands to start with '/'
+            if not line.startswith("/"):
+                print("unknown input (commands start with '/'). Try /help")
+                continue
+
+            # Simple exact commands first
             if line == "/quit":
-                await self.ws.close(); break
-            
+                await self.ws.close()
+                break
+
             if line == "/help":
                 help_items = [
                     ("/help",                                   "list all available commands"),
@@ -195,35 +205,61 @@ class SOCPClient:
                 for cmd, desc in help_items:
                     print(f"{cmd.ljust(col)}# {desc}")
                 continue
-            
+
             if line == "/list":
-                await self._list(); continue
+                try:
+                    await self._list()
+                except Exception as e:
+                    print(f"[list] error: {e!r}")
+                continue
 
             if line == "/pubget":
-                print(self.keys.pub_der_b64u()); continue
-            
+                print(self.keys.pub_der_b64u())
+                continue
+
+            # Commands with arguments
             if line.startswith("/dbget "):
-                _, user = line.split(" ", 1)
-                await self._db_get(user); continue
-            
+                try:
+                    _, user = line.split(" ", 1)
+                    await self._db_get(user.strip())
+                except Exception as e:
+                    print(f"usage: /dbget <user_uuid>  ({e})")
+                continue
+
             if line.startswith("/tell "):
-                try: _, user, text = line.split(" ", 2)
-                except ValueError:
-                    print("usage: /tell <user_uuid> <text>"); continue
-                await self._send_dm(user, text); continue
-            
+                try:
+                    # split once for the user, then keep the rest as text (allows spaces)
+                    parts = line.split(" ", 2)
+                    if len(parts) < 3:
+                        raise ValueError("missing text")
+                    _, user, text = parts
+                    await self._send_dm(user.strip(), text)
+                except Exception as e:
+                    print(f"usage: /tell <user_uuid> <text>  ({e})")
+                continue
+
             if line.startswith("/all "):
-                _, text = line.split(" ", 1)
-                await self._all(text)
+                try:
+                    _, text = line.split(" ", 1)
+                    await self._all(text)
+                except Exception as e:
+                    print(f"usage: /all <text>  ({e})")
                 continue
 
             if line.startswith("/file "):
-                try: _, target, path = line.split(" ", 2)
-                except ValueError:
-                    print("usage: /file <user_uuid|public> <file_path>"); continue
-                
-            await self._fsend(target, pathlib.Path(path))
-            continue
+                try:
+                    # Keep paths with spaces: split into 3 parts max
+                    parts = line.split(" ", 2)
+                    if len(parts) < 3:
+                        raise ValueError("missing target or file_path")
+                    _, target, path_str = parts
+                    await self._fsend(target.strip(), pathlib.Path(path_str.strip()))
+                except Exception as e:
+                    print(f"usage: /file <user_uuid|public> <file_path>  ({e})")
+                continue
+
+            # Fallback for anything else
+            print("unknown command. Try /help")
 
     async def _list(self) -> None:
         """Requests a list of known-online users from the server."""
@@ -332,108 +368,97 @@ class SOCPClient:
         print(f"[you ->  Public Channel] {text}")
 
     async def _fsend(self, target: str, path: pathlib.Path) -> None:
-        """Sends a file either as a DM (RSA-OAEP wrapped per-file key) or to the
-        Public Channel (single per-file key published in FILE_START).
+        """Send a file either as a DM (AES-256-GCM + RSA-OAEP wrapped key)
+        or to the Public Channel (AES-256-GCM; per-file key published in FILE_START).
 
-        Args:
-            target (str): User UUID for DM, or 'public' for the public channel.
-            path (pathlib.Path): Path to the file to send.
+        - DM: include `wrapped_key` in EVERY chunk (receiver expects it per-chunk).
+        - Public: include `pub_key` (base64url AES key) in FILE_START; no wrapped_key in chunks.
+        - Manifest is signed (v1.3) with RSASSA-PSS over canonical fields.
         """
 
-        if not path.exists() or not path.is_file():
-            print("file not found")
-            return
+        async with self._send_lock:  # prevents overlapping/double invocations
+            if not path.exists() or not path.is_file():
+                print("file not found")
+                return
 
-        data = path.read_bytes()
-        sha = hashlib.sha256(data).hexdigest()
-        ts = int(time.time() * 1000)
-        file_id = str(uuid.uuid4())
+            data = path.read_bytes()
+            sha = hashlib.sha256(data).hexdigest()
+            ts = int(time.time() * 1000)
+            file_id = str(uuid.uuid4())
 
-        # Mode selection
-        is_public = (target.lower() == "public")
-        mode = "public" if is_public else "dm"
-        to_field = ("public" if is_public else target)
+            is_public = (target.lower() == "public")
+            mode = "public" if is_public else "dm"
+            to_field = "public" if is_public else target
 
-        # Per-file AES key
-        file_key = os.urandom(32)
+            # Per-file AES key
+            file_key = os.urandom(32)
 
-        # Manifest (FILE_START)
-        pl_start = {
-            "file_id": file_id,
-            "name": path.name,
-            "size": len(data),
-            "sha256": sha,
-            "mode": mode,
-        }
-        if is_public:
-            # Publish the per-file AES key once for all receivers (public channel).
-            pl_start["pub_key"] = b64u_encode(file_key)
+            # Manifest (FILE_START) with signature
+            pl_start = {
+                "file_id": file_id,
+                "name": path.name,
+                "size": len(data),
+                "sha256": sha,
+                "mode": mode,
+                "sender": self.user_uuid,
+                "ts": ts,
+            }
+            if is_public:
+                pl_start["pub_key"] = b64u_encode(file_key)
 
-        env_start = {
-            "type": T_FILE_START,
-            "from": self.user_uuid,
-            "to": to_field,
-            "ts": ts,
-            "payload": pl_start,
-            "sig": "",
-        }
-        await self.ws.send(json.dumps(env_start, separators=(",", ":")))
+            manifest_to_sign = {
+                "file_id": file_id, "name": path.name, "size": len(data),
+                "sha256": sha, "mode": mode, "sender": self.user_uuid, "ts": ts
+            }
+            pl_start["sender_pub"] = self.keys.pub_der_b64u()
+            pl_start["content_sig"] = self.keys.sign_payload(manifest_to_sign)
 
-        # Encrypt & send chunks
-        CHUNK = 60 * 1024
-        if not is_public:
-            # DM: wrap the per-file AES key for the recipient
-            if target not in self.keyring:
+            env_start = {"type": T_FILE_START, "from": self.user_uuid, "to": to_field,
+                        "ts": ts, "payload": pl_start, "sig": ""}
+            await self.ws.send(json.dumps(env_start, separators=(",", ":")))
+
+            # Encrypt & send chunks
+            CHUNK = 60 * 1024
+            if (not is_public) and target not in self.keyring:
                 print("unknown recipient key; run /dbget <user> first")
                 return
-            recip_pub = serialization.load_der_public_key(b64u_decode(self.keyring[target]))
-            wrapped = recip_pub.encrypt(
-                file_key,
-                asy_padding.OAEP(
-                    mgf=asy_padding.MGF1(hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None,
-                ),
-            )
-            wrapped_b64 = b64u_encode(wrapped)
 
-        for i in range(0, len(data), CHUNK):
-            chunk = data[i : i + CHUNK]
-            iv = os.urandom(12)
-            ct_tag = AESGCM(file_key).encrypt(iv, chunk, None)
-            payload = {
-                "file_id": file_id,
-                "index": i // CHUNK,
-                "ciphertext": b64u_encode(ct_tag[:-16]),
-                "iv": b64u_encode(iv),
-                "tag": b64u_encode(ct_tag[-16:]),
-            }
-            if not is_public:
-                payload["wrapped_key"] = wrapped_b64  # DM only
+            for i in range(0, len(data), CHUNK):
+                chunk = data[i:i+CHUNK]
+                iv = os.urandom(12)
+                ct_tag = AESGCM(file_key).encrypt(iv, chunk, None)
+                payload = {
+                    "file_id": file_id,
+                    "index": i // CHUNK,
+                    "ciphertext": b64u_encode(ct_tag[:-16]),
+                    "iv": b64u_encode(iv),
+                    "tag": b64u_encode(ct_tag[-16:]),
+                }
+                if not is_public:
+                    from cryptography.hazmat.primitives import serialization, hashes
+                    from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
+                    recip_pub = serialization.load_der_public_key(b64u_decode(self.keyring[target]))
+                    wrapped = recip_pub.encrypt(
+                        file_key,
+                        asy_padding.OAEP(
+                            mgf=asy_padding.MGF1(hashes.SHA256()),
+                            algorithm=hashes.SHA256(),
+                            label=None,
+                        ),
+                    )
+                    payload["wrapped_key"] = b64u_encode(wrapped)
 
-            env_chunk = {
-                "type": T_FILE_CHUNK,
-                "from": self.user_uuid,
-                "to": to_field,
-                "ts": int(time.time() * 1000),
-                "payload": payload,
-                "sig": "",
-            }
-            await self.ws.send(json.dumps(env_chunk, separators=(",", ":")))
+                env_chunk = {"type": T_FILE_CHUNK, "from": self.user_uuid, "to": to_field,
+                            "ts": int(time.time()*1000), "payload": payload, "sig": ""}
+                await self.ws.send(json.dumps(env_chunk, separators=(",", ":")))
 
-        # Finish (FILE_END)
-        env_end = {
-            "type": T_FILE_END,
-            "from": self.user_uuid,
-            "to": to_field,
-            "ts": int(time.time() * 1000),
-            "payload": {"file_id": file_id},
-            "sig": "",
-        }
-        await self.ws.send(json.dumps(env_end, separators=(",", ":")))
+            # END
+            env_end = {"type": T_FILE_END, "from": self.user_uuid, "to": to_field,
+                    "ts": int(time.time()*1000), "payload": {"file_id": file_id}, "sig": ""}
+            await self.ws.send(json.dumps(env_end, separators=(",", ":")))
 
-        human_to = "Public Channel" if is_public else target
-        print(f"[file] sent {path.name} → {human_to}")
+            # Print exactly once per call
+            print(f"[file] sent {path.name} → {'Public Channel' if is_public else target}")
 
     async def _handle_file_chunk(self, pl: dict) -> None:
         """Processes a single FILE_CHUNK frame: decrypts the chunk and appends it to the open file
@@ -482,44 +507,46 @@ class SOCPClient:
             print(f"[file] decrypt failed for chunk #{idx}: {e}")
 
     async def _handle_file_start(self, pl: dict) -> None:
-        """Initializes receiver-side state for an incoming FILE_START and opens the
-        destination file for writing, using non-clobbering names like 'file.pdf',
-        'file (1).pdf'...  For public channel, prefixes with '<receiver>_'.
+        """Prepare to receive a file.
 
-        Args:
-            pl (dict): FILE_START payload with keys:
-                - file_id (str) : unique file id
-                - name (str)    : sender's filename
-                - size (int)    : total bytes
-                - mode (str)    : 'dm' | 'group' | 'public'
-                - group_id (str, optional)
-                - pub_key (str, optional; base64url)  # public mode only
+        Naming:
+        - DM: keep original filename (e.g., demo.txt)
+        - Public: prefix with receiver name (e.g., Alice_demo.txt)
         """
-
-        fid   = pl.get("file_id")
-        name  = pl.get("name", f"{fid}.bin")
-        size  = pl.get("size", 0)
-        mode  = pl.get("mode", "dm")
+        fid    = pl.get("file_id")
+        orig   = pl.get("name", f"{fid}.bin")
+        size   = pl.get("size", 0)
+        mode   = pl.get("mode", "dm")
         sender = pl.get("sender") or "unknown"
-        public_key = None
+        ts     = pl.get("ts")
 
+        # --- v1.3: verify signed FILE_START manifest
+        sender_pub  = pl.get("sender_pub", "")
+        content_sig = pl.get("content_sig", "")
+        manifest_obj = {
+            "file_id": fid,
+            "name": orig,
+            "size": size,
+            "sha256": pl.get("sha256"),
+            "mode": mode,
+            "sender": sender,
+            "ts": ts,
+        }
+        try:
+            ok = RSAKeys.verify_payload(sender_pub, manifest_obj, content_sig)
+        except Exception:
+            ok = False
+        badge = "🔐" if ok else "⚠️"
+
+        # Name rule: only public gets receiver-name prefix
+        name = f"{self.user_uuid}_{orig}" if mode == "public" else orig
+
+        # Ensure downloads dir & avoid clobbering
         downloads = Path("downloads")
         downloads.mkdir(parents=True, exist_ok=True)
-
-        # Prefix & capture per-file key for public channel
-        if mode == "public":
-            name = f"{sender}_{name}"
-            pub_key_b64 = pl.get("pub_key") or ""
-            try:
-                public_key = b64u_decode(pub_key_b64)
-            except Exception:
-                public_key = None
-
-        # split path and add (1), (2), ... to avoid clobber
         base = downloads / name
         if base.exists():
-            stem = base.stem
-            suffix = base.suffix
+            stem, suffix = base.stem, base.suffix
             k = 1
             while True:
                 candidate = downloads / f"{stem} ({k}){suffix}"
@@ -527,6 +554,15 @@ class SOCPClient:
                     base = candidate
                     break
                 k += 1
+
+        # Capture per-file key for public mode (if present)
+        public_key = None
+        if mode == "public":
+            pub_key_b64 = pl.get("pub_key") or ""
+            try:
+                public_key = b64u_decode(pub_key_b64)
+            except Exception:
+                public_key = None
 
         fh = open(base, "wb")
         self.recv_files[fid] = {
@@ -536,10 +572,10 @@ class SOCPClient:
             "size": size,
             "received": 0,
             "sender": sender,
-            "public_key": public_key
+            "public_key": public_key,
         }
 
-        print(f"[file] from {sender}: start {base.name} ({size} bytes)")
+        print(f"[file] {badge} from {sender}: start {base.name} ({size} bytes)")
 
     async def _handle_file_end(self, pl: dict) -> None:
         """Finalizes an incoming file transfer: closes the file handle and reports the saved path."""
@@ -547,3 +583,23 @@ class SOCPClient:
         if st := self.recv_files.pop(pl.get("file_id"), None):
             st["fh"].close()
             print(f"[file] end → saved to {st['path']}")
+
+    async def _heartbeat(self):
+        """Send a lightweight heartbeat to the server periodically."""
+        # If your protocols.py has T_HEARTBEAT, use it; otherwise "HEARTBEAT" literal works.
+        hb_type = "HEARTBEAT" if "T_HEARTBEAT" not in globals() else T_HEARTBEAT
+        assert self.ws
+        while self.ws and self.ws.open:
+            try:
+                env = {
+                    "type": hb_type,
+                    "from": self.user_uuid,
+                    "to": "server_*",
+                    "ts": int(time.time() * 1000),
+                    "payload": {},
+                    "sig": "",
+                }
+                await self.ws.send(json.dumps(env, separators=(",", ":")))
+            except Exception:
+                break
+            await asyncio.sleep(15)

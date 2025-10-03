@@ -428,8 +428,11 @@ class SOCPServer:
 
         try:
             async for raw in ws:
-                try: msg = json.loads(raw)
-                except Exception: continue
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+
                 t = msg.get("type")
                 if t == T_MSG_PRIVATE:
                     await self._on_msg_private(ws, msg)
@@ -446,17 +449,19 @@ class SOCPServer:
                     if to == ("public" if "CHANNEL_PUBLIC" not in globals() else CHANNEL_PUBLIC) or mode == "public":
                         await self._on_file_public_from_user(msg)
                     else:
-                        # DM path (existing)
                         await self._on_file_from_user(ws, msg)
+                elif t == ("HEARTBEAT" if "T_HEARTBEAT" not in globals() else T_HEARTBEAT):
+                    continue
         finally:
             user_id = self._find_user_by_ws(ws)
             if user_id:
                 self.local_users.pop(user_id, None)
                 if self.user_locations.get(user_id) == "local":
                     self.user_locations.pop(user_id, None)
-                    await self._broadcast_peers(make_env(T_USER_REMOVE, self.server_uuid, "*", {
-                        "user_id": user_id, "location": self.server_uuid
-                    }, self.keys))
+                    await self._broadcast_peers(make_env(
+                        T_USER_REMOVE, self.server_uuid, "*",
+                        {"user_id": user_id, "location": self.server_uuid}, self.keys
+                    ))
 
     async def _on_user_hello(self, ws: websockets.WebSocketCommonProtocol, msg: Dict[str, Any]) -> None:
         """Registers a local user and gossips presence
@@ -699,18 +704,18 @@ class SOCPServer:
     async def _on_file_from_user(self, ws, msg: dict) -> None:
         """
         Route FILE_* from a local user to the recipient:
-        - If recipient is local: deliver FILE_* directly to that user.
+        - If recipient is local: deliver FILE_* directly to that user
         - If remote: forward FILE_* to the hosting server as a peer frame (same type),
         adding payload.user_id = <recipient>.
         """
 
-        t  = msg.get("type")
+        t   = msg.get("type")
         frm = msg.get("from")
         to  = msg.get("to")
         pl  = dict(msg.get("payload", {}) or {})
 
         if t == T_FILE_START:
-            pl.setdefault("sender", frm)
+            pl.setdefault("sender", frm)  # keep sender at source if client didn’t include
 
         loc = self.user_locations.get(to)
         if loc == "local":
@@ -722,7 +727,6 @@ class SOCPServer:
             return
 
         if isinstance(loc, str) and (loc.startswith("server_") or loc.startswith("master_server_")):
-            # forward to remote hosting server (add user_id to payload for clarity)
             lk = self.servers.get(loc)
             if not lk:
                 await self._send_error(ws, E_TIMEOUT, f"no link to {loc}")
@@ -741,8 +745,9 @@ class SOCPServer:
         - fan-out to all peer servers
         - dedupe per (file_id[, index]) to avoid loops
         """
-        t  = msg.get("type")
-        pl = dict(msg.get("payload", {}) or {})
+
+        t   = msg.get("type")
+        pl  = dict(msg.get("payload", {}) or {})
         fid = pl.get("file_id")
         idx = pl.get("index")
         sender = msg.get("from")
@@ -750,8 +755,7 @@ class SOCPServer:
         # Dedupe
         if t == T_FILE_START and fid in self.seen_pub_files_start: return
         if t == T_FILE_CHUNK and (fid, int(idx or 0)) in self.seen_pub_files_chunk: return
-        if t == T_FILE_END and fid in self.seen_pub_files_end: return
-        # mark seen
+        if t == T_FILE_END   and fid in self.seen_pub_files_end: return
         if t == T_FILE_START: self.seen_pub_files_start.add(fid)
         elif t == T_FILE_CHUNK: self.seen_pub_files_chunk.add((fid, int(idx or 0)))
         else: self.seen_pub_files_end.add(fid)
@@ -759,7 +763,7 @@ class SOCPServer:
         # Ensure mode & sender carried to everyone
         pl["mode"] = "public"
         if t == T_FILE_START:
-            pl.setdefault("sender", msg.get("from"))
+            pl.setdefault("sender", sender)
 
         # Deliver to all *other* local users (skip sender)
         for uid, lk in list(self.local_users.items()):
@@ -771,7 +775,7 @@ class SOCPServer:
             except Exception:
                 pass
 
-        # Fan-out to peers (they’ll deliver to their locals; sender isn’t on those servers)
+        # Fan-out to peers
         for peer_id, link in list(self.servers.items()):
             envp = make_env(t, self.server_uuid, peer_id, pl, self.keys)
             try:
@@ -801,8 +805,9 @@ class SOCPServer:
         - re-fan-out to other peers (not back to sender)
         - dedupe per file_id/index
         """
-        t  = msg.get("type")
-        pl = dict(msg.get("payload", {}) or {})
+
+        t   = msg.get("type")
+        pl  = dict(msg.get("payload", {}) or {})
         pl["mode"] = "public"
         src_peer = msg.get("from")
         fid = pl.get("file_id")
@@ -811,23 +816,25 @@ class SOCPServer:
         # Dedupe
         if t == T_FILE_START and fid in self.seen_pub_files_start: return
         if t == T_FILE_CHUNK and (fid, int(idx or 0)) in self.seen_pub_files_chunk: return
-        if t == T_FILE_END and fid in self.seen_pub_files_end: return
+        if t == T_FILE_END   and fid in self.seen_pub_files_end: return
         if t == T_FILE_START: self.seen_pub_files_start.add(fid)
         elif t == T_FILE_CHUNK: self.seen_pub_files_chunk.add((fid, int(idx or 0)))
         else: self.seen_pub_files_end.add(fid)
 
-        pl = dict(pl); pl["mode"] = "public"
-
         # Deliver to locals
         for uid, lk in list(self.local_users.items()):
             env = make_env(t, self.server_uuid, uid, pl, self.keys)
-            try: await self._send_raw(lk.ws, env)
-            except Exception: pass
+            try:
+                await self._send_raw(lk.ws, env)
+            except Exception:
+                pass
 
-        # Re-fan-out to other peers
+        # Re-fan-out to other peers (not back to sender peer)
         for peer_id, link in list(self.servers.items()):
-            if peer_id == src_peer: 
+            if peer_id == src_peer:
                 continue
             envp = make_env(t, self.server_uuid, peer_id, pl, self.keys)
-            try: await self._send_raw(link.ws, envp)
-            except Exception: pass
+            try:
+                await self._send_raw(link.ws, envp)
+            except Exception:
+                pass
