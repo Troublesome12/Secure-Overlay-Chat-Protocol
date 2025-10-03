@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import os
 import sys
 import asyncio
 import json
 import pathlib
 import time
 import uuid
+import hashlib
 import websockets
 
 from pathlib import Path
 from protocols import *
 from crypto import RSAKeys, e2e_encrypt_for, e2e_decrypt_with
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 from encoding import b64u_encode, b64u_decode
 
 """
@@ -19,7 +23,7 @@ SOCP Client (v1.1)
 
 - Connects to one local server over WebSocket
 - Sends USER_HELLO on connect
-- Commands: /help, /pubget, /dbget <user>, /msg <user> <text>, /quit
+- Commands: /help, /pubget, /dbget <user>, /tell <user> <text>, /quit
 - DMs: AES-256-GCM + RSA-OAEP(SHA-256) for the key, RSASSA-PSS(SHA-256) signature
 """
 
@@ -38,7 +42,6 @@ class SOCPClient:
         self.user_uuid = user_uuid
         self.server_url = server_url
         self.keys = RSAKeys.load_or_create(key_path)
-        self.group_keys: dict[str, bytes] = {}
         self.downloads: dict[str, bytearray] = {}
         self.keyring: dict[str,str] = {self.user_uuid: self.keys.pub_der_b64u()}
         self.recv_files: dict[str, dict] = {}       # file_id -> {"fh": f, "path": Path, "mode": str, "group_id": str|None}
@@ -122,61 +125,29 @@ class SOCPClient:
                 else:
                     print(f"[db] user not found: {pl.get('user_id')}")
 
-            elif t == T_GROUP_KEY_SHARE:
-                gid = pl.get("group_id")
-                shares = pl.get("shares") or []
-                # find my share
-                my = next((s for s in shares if s.get("member") == self.user_uuid), None)
-                if gid and my:
-                    try:
-                        from cryptography.hazmat.primitives import serialization, hashes
-                        from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
-                        key = self.keys.priv.decrypt(
-                            b64u_decode(my["wrapped_group_key"]),
-                            asy_padding.OAEP(mgf=asy_padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
-                        )
-                        self.group_keys[gid] = key
-                        print(f"[group] received key for {gid} 🔑")
-                    except Exception as e:
-                        print(f"[group] key unwrap failed for {gid}: {e}")
-
             elif t == T_USER_LIST:
-                users = pl.get("users", [])
-                if not users:
-                    print("[list] (none)")
-                else:
-                    print("[list]")
-                    for u in users:
-                        print(f"  - {u}")
+                users = pl.get("users") or []
+                print("[online]")
+                for u in users:
+                    print(f" - {u}")
 
-            elif t == T_MSG_GROUP:
-                gid = pl.get("group_id")
-                key = self.group_keys.get(gid)
-                if not key:
-                    print(f"[group] missing key for {gid}"); continue
-                try:
-                    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-                    pt = AESGCM(key).decrypt(b64u_decode(pl["iv"]),
-                                            b64u_decode(pl["ciphertext"])+b64u_decode(pl["tag"]),
-                                            None)
-                    text = pt.decode("utf-8", errors="replace")
-                except Exception as e:
-                    text = f"<decrypt failed: {e}>"
-                # signature badge (reuse your badge logic)
+            elif t == T_PUBLIC_POST:
+                p = pl
+                # Verify signature over canonical content
                 from crypto import RSAKeys as _Keys
-                signed_ts = pl.get("content_ts", msg.get("ts"))
                 content_obj = {
-                    "group_id": gid,
-                    "ciphertext": pl.get("ciphertext"),
-                    "iv": pl.get("iv"),
-                    "tag": pl.get("tag"),
-                    "from": pl.get("from"), 
-                    "ts": signed_ts,
+                    "channel": p.get("channel", "public"),
+                    "text": p.get("text", ""),
+                    "from": p.get("from"),
+                    "ts": p.get("ts"),
                 }
-                verified = _Keys.verify_payload(pl.get("sender_pub",""), content_obj, pl.get("content_sig",""))
-                badge = "🔐" if verified else "⚠️"
-                print(f"[(Group) {gid}] {badge} {text}")
-
+                ok = _Keys.verify_payload(p.get("sender_pub", ""), content_obj, p.get("content_sig", ""))
+                # Ignore our own echo (we already print “[you ->  Public Channel] ...”)
+                if p.get("from") == self.user_uuid:
+                    continue
+                badge = "🔐" if ok else "⚠️"
+                print(f"[Public Channel] {badge} {p.get('from')}: {p.get('text')}")
+                
             elif t == T_FILE_START:
                 await self._handle_file_start(pl)      # sets up recv_files[file_id]
             elif t == T_FILE_CHUNK:
@@ -214,15 +185,13 @@ class SOCPClient:
                     ("/help",                                   "list all available commands"),
                     ("/list",                                   "fetch & display known online users (sorted)"),
                     ("/pubget",                                 "print your own public key (SPKI DER base64url)"),
-                    ("/dbget <user_uuid>",                      "fetch & cache <user>'s pubkey via Master (run before /msg or /gshare)"),
-                    ("/msg <user_uuid> <text>",                 "send E2E-encrypted DM (AES-256-GCM + RSA-OAEP wrap + RSA-PSS signature)"),
-                    ("/all <text>",                             "send to default group_global (requires /gshare group_global <members> once)"),
-                    ("/gshare <group_id> <member1> [member2 ...]", "create/rotate group AES-256 key and send wrapped copies to members (requires /dbget for each)"),
-                    ("/gmsg <group_id> <text>",                 "send E2E group message using the current group key (requires prior /gshare)"),
-                    ("/file <user_uuid|group_id> <file_path>", "send file: DM wraps a per-file AES key to user; group uses group key; chunks via FILE_* frames"),
+                    ("/dbget <user_uuid>",                      "fetch & cache <user>'s pubkey via Master (run before /tell)"),
+                    ("/tell <user_uuid> <text>",                "send E2E-encrypted DM (AES-256-GCM + RSA-OAEP wrap + RSA-PSS signature)"),
+                    ("/all <text>",                             "post to the mesh-wide public channel (authentic, not confidential)"),
+                    ("/file <user_uuid|public> <file_path>",    "send file: DM wraps per-file AES key; 'public' is broadcast (no secrecy)"),
                     ("/quit",                                   "close the WebSocket and exit"),
                 ]
-                col = max(len(cmd) for cmd, _ in help_items) + 2        # pad before '#'
+                col = max(len(cmd) for cmd, _ in help_items) + 2
                 for cmd, desc in help_items:
                     print(f"{cmd.ljust(col)}# {desc}")
                 continue
@@ -237,50 +206,27 @@ class SOCPClient:
                 _, user = line.split(" ", 1)
                 await self._db_get(user); continue
             
-            if line.startswith("/msg "):
+            if line.startswith("/tell "):
                 try: _, user, text = line.split(" ", 2)
                 except ValueError:
-                    print("usage: /msg <user_uuid> <text>"); continue
+                    print("usage: /tell <user_uuid> <text>"); continue
                 await self._send_dm(user, text); continue
             
             if line.startswith("/all "):
-                # default group name (you may change this if your cohort picked another)
-                gid = "group_global"
-                if gid not in self.group_keys:
-                    print("missing group key for group_global; run:")
-                    print("  /list  # see online users")
-                    print("  /gshare group_global <member1> [member2 ...]")
-                    continue
-                try: _, text = line.split(" ", 1)
-                except ValueError:
-                    print("usage: /all <text>"); continue
-                await self._gmsg(gid, text); continue
+                _, text = line.split(" ", 1)
+                await self._all(text)
+                continue
 
-            if line.startswith("/gshare "):
-                try:
-                    _, rest = line.split(" ", 1)
-                    gid, members_str = rest.split(" ", 1)
-                    members = members_str.split()
-                except ValueError:
-                    print("usage: /gshare <group_id> <member1> [member2 ...]"); continue
-                await self._gshare(gid, members); continue
-            
-            if line.startswith("/gmsg "):
-                try:
-                    _, gid, text = line.split(" ", 2)
-                except ValueError:
-                    print("usage: /gmsg <group_id> <text>"); continue
-                await self._gmsg(gid, text); continue
-            
             if line.startswith("/file "):
                 try: _, target, path = line.split(" ", 2)
                 except ValueError:
-                    print("usage: /file <user|group_id> <file_path>"); continue
-                await self._fsend(target, pathlib.Path(path)); continue
-            print("unknown command; /help")
+                    print("usage: /file <user_uuid|public> <file_path>"); continue
+                
+            await self._fsend(target, pathlib.Path(path))
+            continue
 
     async def _list(self) -> None:
-        """Requests the server’s current view of online users and prints them."""
+        """Requests a list of known-online users from the server."""
         assert self.ws
         req = {
             "type": T_USER_LIST_REQ,
@@ -349,180 +295,145 @@ class SOCPClient:
         await self.ws.send(json.dumps(env, separators=(',',':')))
         print(f"[you -> {target}] {text}")
 
-    async def _gshare(self, gid: str, members: list[str]) -> None:
-        """Distributes a new group key to members by wrapping it under each member's RSA key
+    async def _all(self, text: str) -> None:
+        """Sends a message to the mesh-wide public channel.
 
         Args:
-            gid (str): Group identifier
-            members (list[str]): User UUIDs (must have been /dbget'ed)
+            text (str): UTF-8 plaintext to post publicly.
         """
 
-        import os, time, json
-        from cryptography.hazmat.primitives import serialization, hashes
-        from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
-        from encoding import b64u_encode, b64u_decode
+        assert self.ws
+        # Per your spec style: we still use end-to-end content signature; server does not decrypt.
+        # For simplicity and to keep payload small, we send plaintext with PSS content_sig;
+        # confidentiality on a public channel is not required; integrity/authenticity is.
 
-        # Ensure we know everyone’s pubkey
-        missing = [m for m in members if m not in self.keyring]
-        if missing:
-            print("missing pubkeys for:", ", ".join(missing))
+        ts = int(time.time() * 1000)
+        content_obj = {
+            "channel": "public",
+            "text": text,
+            "from": self.user_uuid,
+            "ts": ts,
+        }
+        content_sig = self.keys.sign_payload(content_obj)
+        payload = {
+            **content_obj,
+            "sender_pub": self.keys.pub_der_b64u(),
+            "content_sig": content_sig,
+        }
+        env = {
+            "type": "PUBLIC_POST",
+            "from": self.user_uuid,
+            "to": "server_*",
+            "ts": ts,
+            "payload": payload,
+            "sig": "",     # transport sig not required on user->server link (TLS-equivalent); your server signs on peer hops
+        }
+        await self.ws.send(json.dumps(env, separators=(",", ":")))
+        print(f"[you ->  Public Channel] {text}")
+
+    async def _fsend(self, target: str, path: pathlib.Path) -> None:
+        """Sends a file either as a DM (RSA-OAEP wrapped per-file key) or to the
+        Public Channel (single per-file key published in FILE_START).
+
+        Args:
+            target (str): User UUID for DM, or 'public' for the public channel.
+            path (pathlib.Path): Path to the file to send.
+        """
+
+        if not path.exists() or not path.is_file():
+            print("file not found")
             return
 
-        # Create a fresh 256-bit group key and cache it locally
-        key = os.urandom(32)
-        self.group_keys[gid] = key
+        data = path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        ts = int(time.time() * 1000)
+        file_id = str(uuid.uuid4())
 
-        # Wrap the GROUP KEY directly with RSA-OAEP(SHA-256) for each member
-        shares = []
-        for m in members:
-            pub = serialization.load_der_public_key(b64u_decode(self.keyring[m]))
-            wrapped = pub.encrypt(
-                key,
+        # Mode selection
+        is_public = (target.lower() == "public")
+        mode = "public" if is_public else "dm"
+        to_field = ("public" if is_public else target)
+
+        # Per-file AES key
+        file_key = os.urandom(32)
+
+        # Manifest (FILE_START)
+        pl_start = {
+            "file_id": file_id,
+            "name": path.name,
+            "size": len(data),
+            "sha256": sha,
+            "mode": mode,
+        }
+        if is_public:
+            # Publish the per-file AES key once for all receivers (public channel).
+            pl_start["pub_key"] = b64u_encode(file_key)
+
+        env_start = {
+            "type": T_FILE_START,
+            "from": self.user_uuid,
+            "to": to_field,
+            "ts": ts,
+            "payload": pl_start,
+            "sig": "",
+        }
+        await self.ws.send(json.dumps(env_start, separators=(",", ":")))
+
+        # Encrypt & send chunks
+        CHUNK = 60 * 1024
+        if not is_public:
+            # DM: wrap the per-file AES key for the recipient
+            if target not in self.keyring:
+                print("unknown recipient key; run /dbget <user> first")
+                return
+            recip_pub = serialization.load_der_public_key(b64u_decode(self.keyring[target]))
+            wrapped = recip_pub.encrypt(
+                file_key,
                 asy_padding.OAEP(
                     mgf=asy_padding.MGF1(hashes.SHA256()),
                     algorithm=hashes.SHA256(),
                     label=None,
                 ),
             )
-            shares.append({"member": m, "wrapped_group_key": b64u_encode(wrapped)})
+            wrapped_b64 = b64u_encode(wrapped)
 
-        # Sign the content (group_id|shares|creator_pub)
-        content_obj = {
-            "group_id": gid,
-            "shares": shares,
-            "creator_pub": self.keys.pub_der_b64u(),
-            "creator": self.user_uuid,
-        }
-        content_sig = self.keys.sign_payload(content_obj)
+        for i in range(0, len(data), CHUNK):
+            chunk = data[i : i + CHUNK]
+            iv = os.urandom(12)
+            ct_tag = AESGCM(file_key).encrypt(iv, chunk, None)
+            payload = {
+                "file_id": file_id,
+                "index": i // CHUNK,
+                "ciphertext": b64u_encode(ct_tag[:-16]),
+                "iv": b64u_encode(iv),
+                "tag": b64u_encode(ct_tag[-16:]),
+            }
+            if not is_public:
+                payload["wrapped_key"] = wrapped_b64  # DM only
 
-        env = {
-            "type": T_GROUP_KEY_SHARE,
+            env_chunk = {
+                "type": T_FILE_CHUNK,
+                "from": self.user_uuid,
+                "to": to_field,
+                "ts": int(time.time() * 1000),
+                "payload": payload,
+                "sig": "",
+            }
+            await self.ws.send(json.dumps(env_chunk, separators=(",", ":")))
+
+        # Finish (FILE_END)
+        env_end = {
+            "type": T_FILE_END,
             "from": self.user_uuid,
-            "to": "server_*",
-            "ts": int(time.time()*1000),
-            "payload": {**content_obj, "content_sig": content_sig},
+            "to": to_field,
+            "ts": int(time.time() * 1000),
+            "payload": {"file_id": file_id},
             "sig": "",
         }
-        await self.ws.send(json.dumps(env, separators=(",", ":")))
-        print(f"[group] shared key for {gid} → {', '.join(members)}")
+        await self.ws.send(json.dumps(env_end, separators=(",", ":")))
 
-    async def _gmsg(self, gid: str, text: str) -> None:
-        """Encrypts and sends a group message using the stored group key
-
-        Args:
-            gid (str): Group identifier
-            text (str): Message
-        """
-
-        key = self.group_keys.get(gid)
-        if not key:
-            print("missing group key; run /gshare first"); return
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        import os
-        iv = os.urandom(12)
-        ct_tag = AESGCM(key).encrypt(iv, text.encode("utf-8"), None)
-        ciphertext, tag = ct_tag[:-16], ct_tag[-16:]
-        ts = int(time.time()*1000)
-        content_obj = {
-            "group_id": gid,
-            "ciphertext": b64u_encode(ciphertext),
-            "iv": b64u_encode(iv),
-            "tag": b64u_encode(tag),
-            "from": self.user_uuid,
-            "ts": ts,
-        }
-        content_sig = self.keys.sign_payload(content_obj)
-        payload = {**content_obj, "sender_pub": self.keys.pub_der_b64u(), "content_sig": content_sig, "content_ts": ts}
-        env = {"type": T_MSG_GROUP, "from": self.user_uuid, "to": f"{gid}", "ts": ts, "payload": payload, "sig": ""}
-        await self.ws.send(json.dumps(env, separators=(",",":")))
-        print(f"[you -> (Group) {gid}] {text}")
-
-    async def _fsend(self, target: str, path: pathlib.Path) -> None:
-        """Sends a file to a DM target or a group (chunked, AES-256-GCM)
-
-        Args:
-            target (str): user UUID or group_<id>
-            path (pathlib.Path): file path
-        """
-
-        if not path.exists() or not path.is_file():
-            print("file not found"); return
-        data = path.read_bytes()
-        import hashlib, os
-        sha = hashlib.sha256(data).hexdigest()
-        mode = "group" if target.startswith("group_") else "dm"
-
-        # Manifest
-        pl = {
-            "file_id": str(uuid.uuid4()),
-            "name": path.name,
-            "size": len(data),
-            "sha256": sha,
-            "mode": mode,
-        }
-        if mode == "group":
-            gid = target
-            pl["group_id"] = gid
-            if gid not in self.group_keys:
-                print("missing group key; run /gshare first"); return
-        env = {"type": T_FILE_START, "from": self.user_uuid, "to": (target if mode=="dm" else gid),
-            "ts": int(time.time()*1000), "payload": pl, "sig": ""}
-        await self.ws.send(json.dumps(env, separators=(",",":")))
-        # Encrypt & chunk
-        CHUNK = 60 * 1024
-        if mode == "dm":
-            # per-spec: DM chunks include wrapped_key; use one AES key for whole file
-            bundle_key = e2e_encrypt_for(self.keyring.get(target,""), b"\x00"*32)  # placeholder to get structure?
-            # Better: generate key yourself and wrap once:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            key = os.urandom(32)
-            # wrap key for target
-            if target not in self.keyring:
-                print("unknown recipient key; run /dbget first"); return
-            from cryptography.hazmat.primitives import serialization, hashes
-            from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
-            wrapped = serialization.load_der_public_key(b64u_decode(self.keyring[target])).encrypt(
-                key, asy_padding.OAEP(mgf=asy_padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-            )
-            for i in range(0, len(data), CHUNK):
-                chunk = data[i:i+CHUNK]
-                iv = os.urandom(12)
-                ct = AESGCM(key).encrypt(iv, chunk, None)
-                payload = {
-                    "file_id": pl["file_id"],
-                    "index": i//CHUNK,
-                    "ciphertext": b64u_encode(ct[:-16]),
-                    "iv": b64u_encode(iv),
-                    "tag": b64u_encode(ct[-16:]),
-                    "wrapped_key": b64u_encode(wrapped),
-                }
-                env = {"type": T_FILE_CHUNK, "from": self.user_uuid, "to": target, "ts": int(time.time()*1000),
-                    "payload": payload, "sig": ""}
-                await self.ws.send(json.dumps(env, separators=(",",":")))
-        else:
-            # group: use stored group key; no wrapped_key per chunk
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            key = self.group_keys[target]
-            for i in range(0, len(data), CHUNK):
-                chunk = data[i:i+CHUNK]
-                iv = os.urandom(12)
-                ct = AESGCM(key).encrypt(iv, chunk, None)
-                payload = {
-                    "file_id": pl["file_id"],
-                    "index": i//CHUNK,
-                    "ciphertext": b64u_encode(ct[:-16]),
-                    "iv": b64u_encode(iv),
-                    "tag": b64u_encode(ct[-16:]),
-                }
-                env = {"type": T_FILE_CHUNK, "from": self.user_uuid, "to": target, "ts": int(time.time()*1000),
-                    "payload": payload, "sig": ""}
-                await self.ws.send(json.dumps(env, separators=(",",":")))
-
-        # End
-        env = {"type": T_FILE_END, "from": self.user_uuid, "to": (target if mode=="dm" else gid),
-            "ts": int(time.time()*1000), "payload": {"file_id": pl["file_id"]}, "sig": ""}
-        await self.ws.send(json.dumps(env, separators=(",",":")))
-        print(f"[file] sent {path.name} → {target}")
+        human_to = "Public Channel" if is_public else target
+        print(f"[file] sent {path.name} → {human_to}")
 
     async def _handle_file_chunk(self, pl: dict) -> None:
         """Processes a single FILE_CHUNK frame: decrypts the chunk and appends it to the open file
@@ -549,20 +460,20 @@ class SOCPClient:
             return
 
         try:
-            # Decrypt chunk
-            if wrapped_key:
-                # DM case: RSA-OAEP wrapped AES key per file (same wrapped_key on each chunk)
-                pt = e2e_decrypt_with(self.keys.priv, pl)
-            else:
-                # Group case: use stored group key (no wrapped_key)
-                key = self.group_keys[st["group_id"]]
+            if st["mode"] == "public":
+                # Public: decrypt with per-file key from manifest
+                key = st.get("public_key")
+                if not key:
+                    raise ValueError("missing public_key from FILE_START")
                 ct_tag = b64u_decode(ciphertext) + b64u_decode(tag)
                 pt = AESGCM(key).decrypt(b64u_decode(iv), ct_tag, None)
+            elif wrapped_key:
+                # DM: RSA-OAEP wrapped per-file key
+                pt = e2e_decrypt_with(self.keys.priv, pl)
+            else:
+                raise ValueError("no decryption key available for this mode")
 
-            # Write plaintext to the open file handle
             st["fh"].write(pt)
-
-            # Progress
             st["received"] += len(pt)
             pct = (st["received"] / max(st["size"], 1)) * 100
             print(f"[file] chunk #{idx+1} ({st['received']}/{st['size']} bytes, {pct:.0f}%)")
@@ -571,35 +482,64 @@ class SOCPClient:
             print(f"[file] decrypt failed for chunk #{idx}: {e}")
 
     async def _handle_file_start(self, pl: dict) -> None:
-        """Initializes receiver state for an incoming file and opens the output file
+        """Initializes receiver-side state for an incoming FILE_START and opens the
+        destination file for writing, using non-clobbering names like 'file.pdf',
+        'file (1).pdf'...  For public channel, prefixes with '<receiver>_'.
 
         Args:
-            pl (dict): Manifest payload with:
-                - file_id (str): Transfer identifier (unique per file)
-                - name (str): Original filename (used for saving)
-                - size (int): Total plaintext size in bytes
-                - mode (str): "dm" or "group" (determines decryption path)
-                - group_id (str, optional): Group identifier if mode == "group"
+            pl (dict): FILE_START payload with keys:
+                - file_id (str) : unique file id
+                - name (str)    : sender's filename
+                - size (int)    : total bytes
+                - mode (str)    : 'dm' | 'group' | 'public'
+                - group_id (str, optional)
+                - pub_key (str, optional; base64url)  # public mode only
         """
+
         fid   = pl.get("file_id")
         name  = pl.get("name", f"{fid}.bin")
         size  = pl.get("size", 0)
         mode  = pl.get("mode", "dm")
-        gid   = pl.get("group_id")
+        sender = pl.get("sender") or "unknown"
+        public_key = None
 
-        downloads = Path("downloads"); downloads.mkdir(parents=True, exist_ok=True)
-        safe_name = name.split("/")[-1]  # strip any path components
-        path = downloads / safe_name
-        if path.exists():
-            i = 1
-            stem, ext = path.stem, path.suffix
-            while path.exists():
-                path = downloads / f"{stem}({i}){ext}"
-                i += 1
+        downloads = Path("downloads")
+        downloads.mkdir(parents=True, exist_ok=True)
 
-        fh = open(path, "wb")
-        self.recv_files[fid] = {"fh": fh, "path": path, "mode": mode, "group_id": gid, "size": size, "received": 0}
-        print(f"[file] start {safe_name} ({size} bytes)")
+        # Prefix & capture per-file key for public channel
+        if mode == "public":
+            name = f"{sender}_{name}"
+            pub_key_b64 = pl.get("pub_key") or ""
+            try:
+                public_key = b64u_decode(pub_key_b64)
+            except Exception:
+                public_key = None
+
+        # split path and add (1), (2), ... to avoid clobber
+        base = downloads / name
+        if base.exists():
+            stem = base.stem
+            suffix = base.suffix
+            k = 1
+            while True:
+                candidate = downloads / f"{stem} ({k}){suffix}"
+                if not candidate.exists():
+                    base = candidate
+                    break
+                k += 1
+
+        fh = open(base, "wb")
+        self.recv_files[fid] = {
+            "fh": fh,
+            "path": base,
+            "mode": mode,
+            "size": size,
+            "received": 0,
+            "sender": sender,
+            "public_key": public_key
+        }
+
+        print(f"[file] from {sender}: start {base.name} ({size} bytes)")
 
     async def _handle_file_end(self, pl: dict) -> None:
         """Finalizes an incoming file transfer: closes the file handle and reports the saved path."""

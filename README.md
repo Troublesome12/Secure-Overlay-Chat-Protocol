@@ -1,7 +1,7 @@
 # Secure Overlay Chat Protocol (SOCP)
 
-
-This project implements the class Secure Overlay Chat Protocol (SOCP) using Python and WebSockets.
+**Description:** This project implements the class Secure Overlay Chat Protocol (SOCP) using Python and WebSockets.\
+**Version:** v1.3 (protocol freeze)
 
 ## Group Information
 
@@ -82,52 +82,45 @@ python3 src/main.py client --user-uuid Bob --server ws://127.0.0.1:9102
 /help                                               # list all available commands
 /list                                               # fetch & display known online users (sorted)
 /pubget                                             # print your own public key (SPKI DER base64url)
-/dbget <user_uuid>                                  # fetch & cache <user>'s pubkey via Master (run before /msg or /gshare)
-/msg <user_uuid> <text>                             # send E2E-encrypted DM (AES-256-GCM + RSA-OAEP wrap + RSA-PSS signature)
-/gshare <group_id> <member1> [member2 ...]          # create/rotate group AES-256 key and send wrapped copies to members (requires /dbget for each)
-/gmsg <group_id> <text>                             # send E2E group message using the current group key (requires prior /gshare)
-/file <user_uuid|group_id> <file_path>              # send file: DM wraps a per-file AES key to user; group uses group key; chunks via FILE_* frames
+/dbget <user_uuid>                                  # fetch & cache <user>'s pubkey via Master (run before /tell)
+/tell <user_uuid> <text>                            # send E2E-encrypted DM (AES-256-GCM + RSA-OAEP wrap + RSA-PSS signature)
+/all <text>                                         # post to the mesh-wide public channel (authentic, not confidential)
+/file <user_uuid|public> <file_path>                # send file: DM wraps per-file AES; 'public' broadcasts to all (no confidentiality)
 /quit                                               # close the WebSocket and exit
 ```
 
-### 1. Direct Message (DM) Flow
+### Message Flow
+
 ```bash
+# --- DM  ---
+
 # In Alice client:
 /dbget Bob                                   # learn Bob's pubkey (one-time)
-/msg Bob Hello Bob!                          # send E2E DM
+/tell Bob Hello Bob!                         # send E2E DM
 
 # In Bob client:
 /dbget Alice                                 # learn Alice's pubkey for replies
-/msg Alice Hi Alice!                         # reply
+/tell Alice Hi Alice!                        # reply
+
+# --- Public Channel ---
+
+#In any client:
+/all Hello Everyone                          # send message to all the online users
 ```
 
-### 2. Group Message Flow
-```bash
-Group ID: group_demo | Creator: Alice | Members: Bob (add more as needed)
-
-# In Alice client (creator):
-/dbget Bob                                    # fetch each member's pubkey (repeat for all members)
-/gshare group_demo Bob                        # distribute/rotate group key to members
-/gmsg group_demo hello team                   # send a group message
-
-# In Bob client (member):
-/gmsg group_demo hi everyone                  # send to the same group (after receiving key via /gshare)
-```
-
-### 3. File Sharing Flow
+### File Sharing Flow
 
 ```bash
-# --- DM file to Bob ---
+# --- DM  ---
 
 # In Alice client:
 /dbget Bob                                   # ensure you have Bob's pubkey
 /file Bob ./requirements.txt                 # send file (manifest + encrypted chunks)
 
-# --- Group file to group_demo ---
+# --- Public Channel ---
 
-# In Alice client:
-# (after you’ve run: /gshare group_demo Bob ...)
-/file group_demo ./requirements.txt          # uses the current group key; no per-chunk wrapping
+# In any client:
+/file public ./requirements.txt              # send file to all the online users
 ```
 
 ## Cleanup / Reset

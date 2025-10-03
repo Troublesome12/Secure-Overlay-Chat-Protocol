@@ -77,12 +77,15 @@ class SOCPServer:
         self.local_users: Dict[str, Link] = {}
         self.user_locations: Dict[str, str] = {}
         self.pending_db: Dict[str, WebSocketServerProtocol] = {}
-        self.handshakes_done: set[str] = set()
         self.ws_to_peeruuid: Dict[websockets.WebSocketCommonProtocol, str] = {}
-        self.group_members: Dict[str, set[str]] = {}
+        self.seen_public: set[str] = set()  # post-id strings "from|ts"
+        self.seen_pub_files_start: set[str] = set()          # file_id
+        self.seen_pub_files_chunk: set[tuple[str,int]] = set()  # (file_id, index)
+        self.seen_pub_files_end: set[str] = set()
         self.seen_ids: dict[str,int] = {}
         self.url_to_ws = {}
         self.ws_to_url = {}
+
 
     async def run(self) -> None:
         """Starts the WebSocket server and the dialer loop
@@ -270,8 +273,10 @@ class SOCPServer:
         pub = self.server_pubs.get(frm)
         return bool(pub) and RSAKeys.verify_payload(pub, pl, sig)
 
-    async def _msg_dedupe_id(self, msg: dict) -> str:
-        h = hashlib.sha256(json.dumps(msg.get("payload", {}), sort_keys=True, separators=(",",":")).encode()).digest()
+    def _msg_dedupe_id(self, msg: dict) -> str:
+        h = hashlib.sha256(
+            json.dumps(msg.get("payload", {}), sort_keys=True, separators=(",",":")).encode()
+        ).digest()
         return f"{msg.get('ts')}|{msg.get('from')}|{msg.get('to')}|{h[:8].hex()}"
     
     async def _route_peer_frame(self, msg: Dict[str, Any]) -> None:
@@ -318,14 +323,17 @@ class SOCPServer:
                 }, self.keys)
                 await self._send_raw(user_ws, resp)
 
-        elif t == T_GROUP_KEY_SHARE:
-            await self._deliver_group_share_local(pl)
-
-        elif t == T_MSG_GROUP:
-            await self._deliver_group_msg_local(pl)
+        elif t == T_PUBLIC_POST:
+            await self._on_public_from_peer(msg)
 
         elif t in (T_FILE_START, T_FILE_CHUNK, T_FILE_END):
-            await self._deliver_file_local({"type": t, "payload": pl}, override_recipient=pl.get("user_id"))
+            if pl.get("mode") == "public":
+                # file frames for public channel from a peer
+                await self._on_file_public_from_peer(msg)
+            else:
+                # DM file frame from a peer: deliver to the named local recipient
+                # (origin server added payload.user_id when forwarding)
+                await self._deliver_file_local(msg)
 
     async def _handle_peer_deliver(self, pl: Dict[str, Any]) -> None:
         """Handles a PEER_DELIVER by forwarding to local user or to next hop
@@ -360,20 +368,27 @@ class SOCPServer:
             self.db.register_user(uid, pub)
             # optional: print(f"[db] registered {uid}")
 
-    async def _on_user_list(self, ws, msg) -> None:
-        """Return a sorted list of known online users (presence cache)."""
-        try:
-            # users known as local:
-            locals_ = list(self.local_users.keys())
-            # users known via gossip (exclude those we think are offline)
-            remotes = [u for u, loc in self.user_locations.items() if loc != "local"]
-            users = sorted(set(locals_ + remotes))
-            env = make_env(T_USER_LIST, self.server_uuid, msg.get("from", "user_*"), {
-                "users": users
-            }, self.keys)
-            await self._send_raw(ws, env)
-        except Exception:
-            await self._send_error(ws, E_UNKNOWN_TYPE, "list failed")
+    async def _on_user_list_req(self, ws, msg) -> None:
+        """Builds a sorted list of known-online users and replies to the requester.
+
+        Args:
+            ws: WebSocket of the requesting user.
+            msg (dict): The request envelope (unused except for 'from').
+        """
+
+        # Known online = all locally connected users + any users present in user_locations
+        known = set(self.local_users.keys())
+        known.update([u for u, loc in self.user_locations.items() if loc])  # loc: "local" or "server_<uuid>"
+        users_sorted = sorted(known)
+
+        resp = make_env(
+            T_USER_LIST,
+            self.server_uuid,
+            msg.get("from") or "user_*",
+            {"users": users_sorted},
+            self.keys,
+        )
+        await self._send_raw(ws, resp)
 
     async def _handle_db_get_user(self, msg: dict) -> None:
         """Master handler: looks up a user's public key and replies with `T_DB_USER`
@@ -418,16 +433,21 @@ class SOCPServer:
                 t = msg.get("type")
                 if t == T_MSG_PRIVATE:
                     await self._on_msg_private(ws, msg)
+                elif t == T_PUBLIC_POST:
+                    await self._on_public_from_user(ws, msg)
                 elif t == T_USER_LIST_REQ:
-                    await self._on_user_list(ws, msg)
+                    await self._on_user_list_req(ws, msg)
                 elif t == T_USER_DB_GET:
                     await self._on_user_db_get(ws, msg)
-                elif t == T_GROUP_KEY_SHARE:
-                    await self._on_group_key_share(ws, msg)
-                elif t == T_MSG_GROUP:
-                    await self._on_msg_group(ws, msg)
                 elif t in (T_FILE_START, T_FILE_CHUNK, T_FILE_END):
-                    await self._on_file_from_user(ws, msg)
+                    pl = msg.get("payload", {}) or {}
+                    to = msg.get("to", "")
+                    mode = pl.get("mode", "")
+                    if to == ("public" if "CHANNEL_PUBLIC" not in globals() else CHANNEL_PUBLIC) or mode == "public":
+                        await self._on_file_public_from_user(msg)
+                    else:
+                        # DM path (existing)
+                        await self._on_file_from_user(ws, msg)
         finally:
             user_id = self._find_user_by_ws(ws)
             if user_id:
@@ -508,6 +528,36 @@ class SOCPServer:
         else:
             await self._send_error(ws, E_USER_NOT_FOUND, f"unknown location for {to}")
 
+    async def _on_public_from_user(self, ws, msg) -> None:
+        """Handles T_PUBLIC_POST from a local user: deliver to locals and fan-out to peers.
+
+        Args:
+            ws: WebSocket of the sender (unused except for potential errors).
+            msg (dict): Envelope from the user.
+        """
+        
+        pl = msg.get("payload", {}) or {}
+        post_id = f"{pl.get('from')}|{pl.get('ts')}"
+        if post_id in self.seen_public:
+            return
+        self.seen_public.add(post_id)
+
+        # Deliver to all local users (including sender; client ignores own echo)
+        for uid, lk in list(self.local_users.items()):
+            try:
+                env = make_env(T_PUBLIC_POST, self.server_uuid, uid, pl, self.keys)
+                await self._send_raw(lk.ws, env)
+            except Exception:
+                pass
+
+        # Fan-out to all peers
+        for peer_id, link in list(self.servers.items()):
+            try:
+                envp = make_env(T_PUBLIC_POST, self.server_uuid, peer_id, pl, self.keys)
+                await self._send_raw(link.ws, envp)
+            except Exception:
+                pass
+
     async def _on_user_db_get(self, ws: websockets.WebSocketCommonProtocol, msg: Dict[str, Any]) -> None:
         """Handles a user request to fetch another user's pubkey (via Master)
 
@@ -581,20 +631,6 @@ class SOCPServer:
         env = make_env(T_ERROR, self.server_uuid, "server_*", {"code": code, "detail": detail}, self.keys)
         await self._send_raw(ws, env)
 
-    async def _send_error(self, ws: websockets.WebSocketCommonProtocol, code: str, detail: str) -> None:
-        """Sends a standardized ERROR envelope to a socket
-
-        Args:
-            ws (websockets.WebSocketCommonProtocol): Destination socket
-            code (str): Error code (e.g., USER_NOT_FOUND, NAME_IN_USE)
-            detail (str): Human-readable detail text
-        """
-
-        for sid, lk in list(self.servers.items()):
-            if lk.ws is ws: self.servers.pop(sid, None)
-        for uid, lk in list(self.local_users.items()):
-            if lk.ws is ws: self.local_users.pop(uid, None)
-
     def _detach_ws(self, ws: websockets.WebSocketCommonProtocol) -> None:
         """Removes any server/user link entries associated with a socket
 
@@ -623,170 +659,175 @@ class SOCPServer:
             if lk.ws is ws: return uid
         return None
     
-    # -------- Groups --------
+    # -------- Public Channel --------
 
-    async def _on_group_key_share(self, ws, msg: dict) -> None:
-        """Accepts GROUP_KEY_SHARE from a local user, caches members, and routes shares
+    async def _on_public_from_peer(self, msg: dict) -> None:
+        """Handles T_PUBLIC_POST from a peer: deliver to locals and re-fan-out to other peers.
 
         Args:
-            ws: User websocket.
-            msg (dict): GROUP_KEY_SHARE frame from creator. payload keys:
-                - group_id (str)
-                - shares (list[{member,str wrapped_group_key}])
-                - creator_pub (str), content_sig (str)
+            msg (dict): Peer envelope.
         """
 
         pl = msg.get("payload", {}) or {}
-        gid: str = pl.get("group_id")
-        shares = pl.get("shares") or []
-        # Cache membership (for routing future MSG_GROUP / file fanout)
-        members = {s.get("member") for s in shares if s.get("member")}
-        if creator := pl.get("creator") or msg.get("from"):
-            members.add(creator)
+        src_peer = msg.get("from")  # the peer server UUID we received from
+        post_id = f"{pl.get('from')}|{pl.get('ts')}"
 
-        if gid and members:
-            self.group_members.setdefault(gid, set()).update(members)
-
-        # Route each share to the member’s hosting server (or deliver local)
-        for s in shares:
-            member = s.get("member")
-            if not member:
-                continue
-            loc = self.user_locations.get(member)
-            if loc == "local":
-                self.group_members.setdefault(gid, set()).add(member)
-                if link := self.local_users.get(member):
-                    env = make_env(T_GROUP_KEY_SHARE, self.server_uuid, member, pl, self.keys)
-                    await self._send_raw(link.ws, env)
-            elif isinstance(loc, str) and (loc.startswith("master_server_") or loc.startswith("server_")):
-                lk = self.servers.get(loc)
-                if lk:
-                    await self._send_raw(lk.ws, make_env(T_GROUP_KEY_SHARE, self.server_uuid, loc, pl, self.keys))
-
-    async def _deliver_group_share_local(self, pl: dict) -> None:
-        """Delivers a GROUP_KEY_SHARE to any local members listed in payload.shares"""
-
-        gid = pl.get("group_id")
-        creator = pl.get("creator")
-        if gid and creator:
-            self.group_members.setdefault(gid, set()).add(creator)
-
-        shares = pl.get("shares") or []
-        for s in shares:
-            member = s.get("member")
-            if not member: continue
-            self.group_members.setdefault(gid, set()).add(member)
-            if member in self.local_users:
-                env = make_env(T_GROUP_KEY_SHARE, self.server_uuid, member, pl, self.keys)
-                await self._send_raw(self.local_users[member].ws, env)
-
-    async def _on_msg_group(self, ws, msg: dict) -> None:
-        """Fans-out a MSG_GROUP from a local sender to all known group members
-
-        Args:
-            ws: User websocket
-            msg (dict): MSG_GROUP frame with payload:
-                - group_id, ciphertext, iv, tag, sender_pub, content_sig, content_ts
-        """
-
-        pl = msg.get("payload", {}) or {}
-        gid = pl.get("group_id")
-        if not gid:
+        if post_id in self.seen_public:
             return
-        members = self.group_members.get(gid, set())
-        sender = msg.get("from")
-        for m in members:
-            if m == sender:
+        self.seen_public.add(post_id)
+
+        # Deliver to all local users
+        for uid, lk in list(self.local_users.items()):
+            try:
+                env = make_env(T_PUBLIC_POST, self.server_uuid, uid, pl, self.keys)
+                await self._send_raw(lk.ws, env)
+            except Exception:
+                pass
+
+        # Re-fan-out to other peers (avoid bouncing back to the sender peer)
+        for peer_id, link in list(self.servers.items()):
+            if peer_id == src_peer:
                 continue
-            loc = self.user_locations.get(m)
-            if loc == "local":
-                # deliver to the user
-                await self._deliver_group_msg_local(pl, override_recipient=m)
-            elif isinstance(loc, str) and (loc.startswith("master_server_") or loc.startswith("server_")):
-                lk = self.servers.get(loc)
-                if lk:
-                    await self._send_raw(lk.ws, make_env(T_MSG_GROUP, self.server_uuid, loc, pl, self.keys))
-
-    async def _deliver_group_msg_local(self, pl: dict, override_recipient: Optional[str] = None) -> None:
-        """Delivers a group message to a local member (if present)"""
-
-        gid = pl.get("group_id")
-        # infer members from cached table; deliver to specific user if given
-        if override_recipient:
-            if override_recipient in self.local_users:
-                await self._send_raw(self.local_users[override_recipient].ws,
-                                    make_env(T_MSG_GROUP, self.server_uuid, override_recipient, pl, self.keys))
-            return
-        # generic: deliver to any local members of this group
-        for m in self.group_members.get(gid, set()):
-            if m in self.local_users:
-                await self._send_raw(self.local_users[m].ws,
-                                    make_env(T_MSG_GROUP, self.server_uuid, m, pl, self.keys))
+            try:
+                envp = make_env(T_PUBLIC_POST, self.server_uuid, peer_id, pl, self.keys)
+                await self._send_raw(link.ws, envp)
+            except Exception:
+                pass
 
     # -------- Files --------
 
     async def _on_file_from_user(self, ws, msg: dict) -> None:
-        """Route FILE_* from a user to a local/remote user, or fan-out to a group."""
-        t  = msg.get("type")
-        to = msg.get("to", "")
-        pl = msg.get("payload", {}) or {}
-
-        # Group mode if payload says so, else DM to a single user
-        if pl.get("mode") == "group" or (isinstance(to, str) and to.startswith("group_")):
-            gid = pl.get("group_id") or to
-            await self._file_route_group(gid, msg)
-        else:
-            # DM: 'to' must be a user id
-            await self._file_route_dm(to, msg)
-
-    async def _file_route_dm(self, user_id: str, msg: dict) -> None:
-        """DM file routing: deliver locally or forward to hosting server."""
-        loc = self.user_locations.get(user_id)
-        if loc == "local":
-            await self._deliver_file_local(msg, override_recipient=user_id)
-        elif isinstance(loc, str) and (loc.startswith("master_server_") or loc.startswith("server_")):
-            lk = self.servers.get(loc)
-            if lk:
-                # include recipient for the remote server
-                payload = {**msg.get("payload", {}), "user_id": user_id}
-                await self._send_raw(lk.ws, make_env(msg["type"], self.server_uuid, loc, payload, self.keys))
-        else:
-            # optional: tell sender we don't know where the user is
-            if isinstance(ws, websockets.WebSocketCommonProtocol):
-                await self._send_error(ws, E_USER_NOT_FOUND, f"unknown location for {user_id}")
-
-    async def _file_route_group(self, gid: str, msg: dict) -> None:
-        """Fan-out FILE_* to all known members of a group (except the sender)."""
-        pl     = msg.get("payload", {}) or {}
-        sender = msg.get("from")
-        members = self.group_members.get(gid, set()) if hasattr(self, "group_members") else set()
-        if not members:
-            return
-        for m in members:
-            if m == sender:
-                continue
-            loc = self.user_locations.get(m)
-            if loc == "local":
-                await self._deliver_file_local(msg, override_recipient=m)
-            elif isinstance(loc, str) and (loc.startswith("master_server_") or loc.startswith("server_")):
-                lk = self.servers.get(loc)
-                if lk:
-                    payload = {**pl, "user_id": m}
-                    await self._send_raw(lk.ws, make_env(msg["type"], self.server_uuid, loc, payload, self.keys))
-
-    async def _deliver_file_local(self, msg: dict, override_recipient: Optional[str] = None) -> None:
-        """Delivers FILE_* frames to a local user
-
-        Args:
-            msg (dict): Original USER/PEER frame (we pass through payload)
-            override_recipient (Optional[str]): Specific user to deliver to
+        """
+        Route FILE_* from a local user to the recipient:
+        - If recipient is local: deliver FILE_* directly to that user.
+        - If remote: forward FILE_* to the hosting server as a peer frame (same type),
+        adding payload.user_id = <recipient>.
         """
 
-        to_user = override_recipient or msg.get("to") or msg.get("payload", {}).get("user_id")
-        if not isinstance(to_user, str):
+        t  = msg.get("type")
+        frm = msg.get("from")
+        to  = msg.get("to")
+        pl  = dict(msg.get("payload", {}) or {})
+
+        if t == T_FILE_START:
+            pl.setdefault("sender", frm)
+
+        loc = self.user_locations.get(to)
+        if loc == "local":
+            if lk := self.local_users.get(to):
+                env = make_env(t, self.server_uuid, to, pl, self.keys)
+                await self._send_raw(lk.ws, env)
+            else:
+                await self._send_error(ws, E_TIMEOUT, f"{to} not attached")
             return
-        link = self.local_users.get(to_user)
-        if not link:
+
+        if isinstance(loc, str) and (loc.startswith("server_") or loc.startswith("master_server_")):
+            # forward to remote hosting server (add user_id to payload for clarity)
+            lk = self.servers.get(loc)
+            if not lk:
+                await self._send_error(ws, E_TIMEOUT, f"no link to {loc}")
+                return
+            fwd = dict(pl)
+            fwd.setdefault("user_id", to)
+            peer_env = make_env(t, self.server_uuid, loc, fwd, self.keys)
+            await self._send_raw(lk.ws, peer_env)
             return
-        env = make_env(msg["type"], self.server_uuid, to_user, msg.get("payload", {}) or {}, self.keys)
-        await self._send_raw(link.ws, env)
+
+        await self._send_error(ws, E_USER_NOT_FOUND, f"unknown location for {to}")
+
+    async def _on_file_public_from_user(self, msg: dict) -> None:
+        """Broadcasts FILE_* from a local user to Public Channel:
+        - deliver to all local users
+        - fan-out to all peer servers
+        - dedupe per (file_id[, index]) to avoid loops
+        """
+        t  = msg.get("type")
+        pl = dict(msg.get("payload", {}) or {})
+        fid = pl.get("file_id")
+        idx = pl.get("index")
+        sender = msg.get("from")
+
+        # Dedupe
+        if t == T_FILE_START and fid in self.seen_pub_files_start: return
+        if t == T_FILE_CHUNK and (fid, int(idx or 0)) in self.seen_pub_files_chunk: return
+        if t == T_FILE_END and fid in self.seen_pub_files_end: return
+        # mark seen
+        if t == T_FILE_START: self.seen_pub_files_start.add(fid)
+        elif t == T_FILE_CHUNK: self.seen_pub_files_chunk.add((fid, int(idx or 0)))
+        else: self.seen_pub_files_end.add(fid)
+
+        # Ensure mode & sender carried to everyone
+        pl["mode"] = "public"
+        if t == T_FILE_START:
+            pl.setdefault("sender", msg.get("from"))
+
+        # Deliver to all *other* local users (skip sender)
+        for uid, lk in list(self.local_users.items()):
+            if uid == sender:
+                continue
+            env = make_env(t, self.server_uuid, uid, pl, self.keys)
+            try:
+                await self._send_raw(lk.ws, env)
+            except Exception:
+                pass
+
+        # Fan-out to peers (they’ll deliver to their locals; sender isn’t on those servers)
+        for peer_id, link in list(self.servers.items()):
+            envp = make_env(t, self.server_uuid, peer_id, pl, self.keys)
+            try:
+                await self._send_raw(link.ws, envp)
+            except Exception:
+                pass
+
+    async def _deliver_file_local(self, msg: dict) -> None:
+        """
+        Deliver a FILE_* frame (arrived from a peer) to the local recipient.
+        Expects payload.user_id to be set by the origin server when forwarding.
+        """
+        t  = msg.get("type")
+        pl = msg.get("payload", {}) or {}
+        user = pl.get("user_id")
+        if not user:
+            return
+        lk = self.local_users.get(user)
+        if not lk:
+            return
+        env = make_env(t, self.server_uuid, user, pl, self.keys)
+        await self._send_raw(lk.ws, env)
+
+    async def _on_file_public_from_peer(self, msg: dict) -> None:
+        """Handles FILE_* for Public Channel from a peer:
+        - deliver to local users
+        - re-fan-out to other peers (not back to sender)
+        - dedupe per file_id/index
+        """
+        t  = msg.get("type")
+        pl = dict(msg.get("payload", {}) or {})
+        pl["mode"] = "public"
+        src_peer = msg.get("from")
+        fid = pl.get("file_id")
+        idx = pl.get("index")
+
+        # Dedupe
+        if t == T_FILE_START and fid in self.seen_pub_files_start: return
+        if t == T_FILE_CHUNK and (fid, int(idx or 0)) in self.seen_pub_files_chunk: return
+        if t == T_FILE_END and fid in self.seen_pub_files_end: return
+        if t == T_FILE_START: self.seen_pub_files_start.add(fid)
+        elif t == T_FILE_CHUNK: self.seen_pub_files_chunk.add((fid, int(idx or 0)))
+        else: self.seen_pub_files_end.add(fid)
+
+        pl = dict(pl); pl["mode"] = "public"
+
+        # Deliver to locals
+        for uid, lk in list(self.local_users.items()):
+            env = make_env(t, self.server_uuid, uid, pl, self.keys)
+            try: await self._send_raw(lk.ws, env)
+            except Exception: pass
+
+        # Re-fan-out to other peers
+        for peer_id, link in list(self.servers.items()):
+            if peer_id == src_peer: 
+                continue
+            envp = make_env(t, self.server_uuid, peer_id, pl, self.keys)
+            try: await self._send_raw(link.ws, envp)
+            except Exception: pass

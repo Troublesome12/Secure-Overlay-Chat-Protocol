@@ -1,13 +1,13 @@
 # SOCP Test Plan & Results
 
 **Project:** Secure Overlay Chat Protocol (SOCP)\
-**Version:** v1.1 (protocol freeze)\
+**Version:** v1.3 (protocol freeze)\
 **Repo layout:** flat `src/` (server, client); JSON Master DB; WebSocket
 transport
 
 ---
 
-## 0) How to Reproduce
+## Installation
 
 ``` bash
 # (recommended) virtual env
@@ -33,83 +33,187 @@ python3 src/main.py client --user-uuid Bob   --server ws://127.0.0.1:9102
 ```
 
 Common client commands (for tests):
-
-    /help
-    /list
-    /pubget
-    /dbget <user>
-    /msg <user> <text>
-    /gshare <group_id> <member1> [member2 ...]
-    /gmsg <group_id> <text>
-    /file <user|group_id> <path>
-    /quit
-
+```
+/help
+/list
+/pubget
+/dbget <user_uuid>
+/tell <user_uuid> <text>
+/all <text>
+/file <user_uuid|public> <file_path>
+/quit
+```
 Artifacts saved under: 
 - `downloads/` (received files) 
 - `data/master_db.json` (directory) 
 - `keys/` (generated keys)
 
 
-## 1) Unit Tests
+## Test
 
-| Test ID  |   Component                    |     Input      |      Expected Result    |    Actual Result    |   Status  |
-|:--------:|:------------------------------:|:--------------:|:-----------------------:|:-------------------:|:---------:|
-|  UT-01   | Base64url encode/decode        | `"hello"`      | decode(encode(x)) == x  |     matched         |   Pass    |
-|  UT-02   | Canonical JSON                 | `{b:2,a:1}`    | stable byte sequence    |      stable         |   Pass    |
-|  UT-03   | RSA sign/verify (PSS/SHA-256)  | sample payload | verify ok w/ right key, fail w/ wrong |    as expected    |      Pass         |
-|  UT-04   | RSA-OAEP unwrap                | random 32-byte key | unwrap equals original    |  as expected  |   Pass    |
-|  UT-05   | AES-256-GCM                    | plaintext `"test123"` + random IV | decrypt → original | as expected  |   Pass    |
+### 1. Direct Messaging (`/tell`)
 
-> Notes: exercised via small harness (manual run) using `crypto.py` helpers.
+<table>
+  <thead>
+    <tr>
+      <th style="text-align:center;">Test Case</th>
+      <th style="text-align:center;">Steps</th>
+      <th style="text-align:center;">Expected Result</th>
+      <th style="text-align:center;">Actual Result</th>
+      <th style="text-align:center;">Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align:center;">Send DM</td>
+      <td style="text-align:left;">1. Alice runs <code>/dbget Bob</code> <br>2. Alice runs <code>/tell Bob Hello Bob</code> </td>
+      <td style="text-align:left;">Bob sees <code>[dm from Alice] 🔐 Hello Bob</code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+    <tr>
+      <td style="text-align:center;">Tampered Message </td>
+      <td style="text-align:left;">Modify ciphertext in transit</code> </td>
+      <td style="text-align:left;">Bob sees <code>[dm from Alice] ⚠️ <decrypt failed: ...></code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+  </tbody>
+</table><br>
 
+---
 
-## 2) Integration Tests
+### 2. Public Channel Messaging (`/all`)
 
-| Test ID  |   Feature                      |     Steps      |      Expected Result    |    Actual Result    |   Status  |
-|:--------:|:------------------------------:|:--------------:|:-----------------------:|:-------------------:|:---------:|
-|  IT-01   | **/msg** DM | Alice: `/dbget Bob` → `/msg Bob Hello Bob!` | Bob prints `[dm from Alice] 🔐 Hello Bob!` | matched | pass |
-|  IT-02   | **/list** presence | Start Alice & Bob; on either client: `/list` | Shows both users (sorted) | matched | pass |
-|  IT-03   | **/gshare** + **/gmsg** | Alice: `/gshare group_demo Bob` → `/gmsg group_demo hello team`  | Bob `[(Group) group_demo] 🔐 hello team` | matched | pass |
-|  IT-04   | **/file** DM | Alice: `/file Bob ./requirements.txt`  | Bob receives `downloads/requirements.txt` (size matches)  | matched | pass |
-|  IT-05   | **/file** Group | Alice: `/gshare group_demo Bob` → `/file group_demo ./requirements.txt`  | All members get same file named `downloads/requirements.txt` | matched | pass |
-|  IT-06   | Signature badge | Send DM and Group msg  | Badge is 🔐 when signature verifies, ⚠️ on mismatch | as expected | pass |
+<table>
+  <thead>
+    <tr>
+      <th style="text-align:center;">Test Case</th>
+      <th style="text-align:center;">Steps</th>
+      <th style="text-align:center;">Expected Result</th>
+      <th style="text-align:center;">Actual Result</th>
+      <th style="text-align:center;">Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align:center;">Broadcast message</td>
+      <td style="text-align:left;">Alice runs <code>/all hello</code> </td>
+      <td style="text-align:left;">Alice sees <code>[you -> Public Channel] hello</code><br>Bob sees <code>[Public Channel] 🔐 Alice: hello</code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+    <tr>
+      <td style="text-align:center;">Deduplication</td>
+      <td style="text-align:left;">Forwarded message loops</code> </td>
+      <td style="text-align:left;">Only one copy is displayed per user</td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+  </tbody>
+</table><br>
 
+---
 
-## 3) System / Routing Tests (Multi-node)
+### 3. File Transfer (DM: `/file <user_uuid> <path>`)
 
-| Test ID  |   Setup                      |     Steps      |      Expected Result    |    Actual Result    |   Status  |
-|:--------:|:----------------------------:|:--------------:|:-----------------------:|:-------------------:|:---------:|
-|  ST-01   | Master + Local | Alice on Master, Bob on Local; `/msg` both ways | Routed via `PEER_DELIVER`; both receive  | as expected | pass |
-|  ST-02   | Peer flaps | Stop Local; restart; send again | Master logs single `[peer] linked …` per stable link; messages resume | as expected | pass |
-|  ST-03   | Presence gossip | Connect/disconnect Bob | Alice's `/list` updates accordingly | as expected | pass |
-|  ST-04   | Large file | `/file Bob <~5MB>` | Multiple `[file] chunk #N` lines until 100% | as expected | pass |
+<table>
+  <thead>
+    <tr>
+      <th style="text-align:center;">Test Case</th>
+      <th style="text-align:center;">Steps</th>
+      <th style="text-align:center;">Expected Result</th>
+      <th style="text-align:center;">Actual Result</th>
+      <th style="text-align:center;">Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align:center;">Send file via DM</td>
+      <td style="text-align:left;">Alice runs <code>/file Bob ./requirements.txt</code></td>
+      <td style="text-align:left;">Bob sees:<br> <code>[file] start requirements.txt (38 bytes)</code><br><code>[file] chunk #1 (38/38 bytes, 100%)</code><br><code>[file] end → saved to downloads/requirements.txt</code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+    <tr>
+      <td style="text-align:center;">Non-clobber</td>
+      <td style="text-align:left;">Bob already has <code>requirements.txt</code></td>
+      <td style="text-align:left;">Saved as <code>requirements (1).txt</code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+  </tbody>
+</table><br>
 
-## 4) Negative / Robustness Tests
+---
 
-| Test ID  |   Case                       |     Steps      |      Expected Result    |    Actual Result    |   Status  |
-|:--------:|:----------------------------:|:--------------:|:-----------------------:|:-------------------:|:---------:|
-|  NT-01   | Missing recipient key | Alice `/msg Carol hi` [w/o `/dbget Carol`] | Client warns “unknown recipient key”  | as expected | pass |
-|  NT-02   | Malformed DM (no wrapped_key) | Inject frame (dev) | Receiver prints `[dm] malformed frame …` and ignores  | as expected | pass |
-|  NT-03   | Wrong signature | Tamper `content_sig` (dev) | Badge ⚠️ and text still decrypts (integrity via GCM remains)  | as expected | pass |
-|  NT-04   | Group msg w/o key | Bob `/gmsg group_demo hi` [w/o `/gshare group_demo Carol`] | Client prints “missing group key; run /gshare first”  | as expected | pass |
+### 4. File Transfer (Public: `/file public <path>`)
 
+<table>
+  <thead>
+    <tr>
+      <th style="text-align:center;">Test Case</th>
+      <th style="text-align:center;">Steps</th>
+      <th style="text-align:center;">Expected Result</th>
+      <th style="text-align:center;">Actual Result</th>
+      <th style="text-align:center;">Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align:center;">Broadcast file</td>
+      <td style="text-align:left;">Bob runs <code>/file public ./report.pdf</code></td>
+      <td style="text-align:left;">Alice sees:<br> <code>[file] from Bob: start Bob_report.pdf (...)</code><br><code>[file] end → saved to downloads/Bob_report.pdf</code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+    <tr>
+      <td style="text-align:center;">Exclude sender</td>
+      <td style="text-align:left;">Bob sends file to public</td>
+      <td style="text-align:left;">Bob does not receive his own file</code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+    <tr>
+      <td style="text-align:center;">Non-clobber</td>
+      <td style="text-align:left;">Alice already has <code>Bob_report.pdf</code></td>
+      <td style="text-align:left;">Saved as <code>Bob_report (1).pdf</code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+  </tbody>
+</table><br>
 
-## 5) Interoperability (with another group)
+---
 
-**Partner group:** *Group X (insert team name)*
+### 5. User Presence (`/list`)
 
-| Test ID  |   Feature                       |     Steps      |      Expected        |        Actual        |   Notes   |
-|:--------:|:----------------------------:|:--------------:|:-----------------------:|:--------------------:|:---------:|
-|  IO-01   | DM (our → theirs) | Our Alice /msg to their Bob (after exchanging pubkeys) | Decrypted message | as expected | Aligned on envelope & b64url |
-|  IO-02   | DM (theirs → ours) | Their Alice → our Bob | Decrypted message | as expected | Aligned on envelope & b64url |
-|  IO-03   | File transfer | Our Alice `/file` to their Bob  | File reconstructed | as expected | Required chunk size ≤ 60KB |
-|  IO-04   | Group msg | Cross-share group key then send `/gmsg` | Everyone receives | as expected | Decrypts |
+<table>
+  <thead>
+    <tr>
+      <th style="text-align:center;">Test Case</th>
+      <th style="text-align:center;">Steps</th>
+      <th style="text-align:center;">Expected Result</th>
+      <th style="text-align:center;">Actual Result</th>
+      <th style="text-align:center;">Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align:center;">List users</td>
+      <td style="text-align:left;">Alice runs <code>/list</code></td>
+      <td style="text-align:left;">Alice sees:<br> <code>[online]</code><br><code>- Alice</code><br><code>- Bob</code></td>
+      <td style="text-align:center;">as expected</td>
+      <td style="text-align:center;"><b>Pass</b></td>
+    </tr>
+  </tbody>
+</table><br>
 
+---
 
-## 6) Coverage of Mandatory Features
+## Coverage of Mandatory Features
 
 -   `/list` ✓ 
--   `/tell <user> <text>` → **alias:** `/msg` ✓
--   `/all <text>` → **alias:** use a well-known default group (e.g.,
-    `group_all`) via `/gshare` + `/gmsg` ✓
--   `/file` ✓
+-   `/tell <user_uuid> <text>` ✓
+-   `/all <text>` ✓
+-   `/file <user_uuid|public> <path>` ✓
