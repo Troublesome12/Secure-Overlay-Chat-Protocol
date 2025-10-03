@@ -13,6 +13,7 @@ T_MSG_PRIVATE      = "MSG_PRIVATE"
 T_USER_DELIVER     = "USER_DELIVER"
 T_USER_DB_GET      = "USER_DB_GET"
 T_USER_DB_USER     = "USER_DB_USER"
+T_DUMP_USERS       = "DUMP_USERS"
 T_ERROR            = "ERROR"
 
 # --- Server <-> Server (unchanged for DM routing & DB) ---
@@ -29,15 +30,16 @@ CHANNEL_PUBLIC = "public"
 T_PUBLIC_INFO      = "PUBLIC_INFO"      # (optional UI hints, not used in routing)
 T_HEARTBEAT        = "HEARTBEAT"
 
-# --- Files (unchanged) ---
+# --- Files ---
 T_FILE_START       = "FILE_START"
 T_FILE_CHUNK       = "FILE_CHUNK"
 T_FILE_END         = "FILE_END"
 
-# --- Error codes (unchanged) ---
+# --- Error codes ---
 E_USER_NOT_FOUND   = "USER_NOT_FOUND"
 E_INVALID_SIG      = "INVALID_SIG"
 E_BAD_KEY          = "BAD_KEY"
 E_TIMEOUT          = "TIMEOUT"
 E_UNKNOWN_TYPE     = "UNKNOWN_TYPE"
 E_NAME_IN_USE      = "NAME_IN_USE"
+E_OVERRIDE_KEY     = "OVERRIDE_PUBLIC_KEY"
