@@ -357,6 +357,24 @@ class SOCPServer:
         elif t == T_PEER_DELIVER:
             await self._handle_peer_deliver(pl)
 
+        elif t == T_SERVER_DELIVER:
+            pl = msg.get("payload", {}) or {}
+            user = pl.get("user_id")
+            loc = self.user_locations.get(user)
+            if loc == "local":
+                await self._deliver_to_local_user(user, {
+                    "ciphertext": pl.get("ciphertext"),
+                    "sender": pl.get("sender"),
+                    "sender_pub": pl.get("sender_pub"),
+                    "content_sig": pl.get("content_sig",""),
+                    "content_ts": pl.get("content_ts"),
+                })
+            elif isinstance(loc, str) and loc.startswith(("server_", "master_server_")):
+                lk = self.servers.get(loc)
+                if lk:
+                    # forward unchanged
+                    await self._send_raw(lk.ws, msg)
+
         elif t == T_DB_GET_USER and self.is_master:
             await self._handle_db_get_user(msg)
 
@@ -374,7 +392,10 @@ class SOCPServer:
                 }, self.keys)
                 await self._send_raw(user_ws, resp)
 
-        elif t == T_PUBLIC_POST:
+        elif t in (T_PUBLIC_CHANNEL_ADD, T_PUBLIC_CHANNEL_UPDATED, T_PUBLIC_CHANNEL_KEY_SHARE):
+            await self._broadcast_peers(msg)
+
+        elif t == T_MSG_PUBLIC_CHANNEL:
             await self._on_public_from_peer(msg)
 
         elif t in (T_FILE_START, T_FILE_CHUNK, T_FILE_END):
@@ -485,9 +506,11 @@ class SOCPServer:
                     continue
 
                 t = msg.get("type")
-                if t == T_MSG_PRIVATE:
-                    await self._on_msg_private(ws, msg)
-                elif t == T_PUBLIC_POST:
+                if t == T_MSG_DIRECT:
+                    await self._on_msg_direct(ws, msg)
+                elif t in (T_PUBLIC_CHANNEL_ADD, T_PUBLIC_CHANNEL_UPDATED, T_PUBLIC_CHANNEL_KEY_SHARE):
+                    await self._broadcast_peers(make_env(t, self.server_uuid, "*", msg.get("payload", {}), self.keys))
+                elif t  == T_MSG_PUBLIC_CHANNEL:
                     await self._on_public_from_user(ws, msg)
                 elif t == T_USER_LIST_REQ:
                     await self._on_user_list_req(ws, msg)
@@ -688,44 +711,47 @@ class SOCPServer:
         }, self.keys))
         print(f"[user] connected: {user_id}")
 
-    async def _on_msg_private(self, ws: websockets.WebSocketCommonProtocol, msg: Dict[str, Any]) -> None:
-        """Routes an incoming MSG_PRIVATE from a local user
+    async def _on_msg_direct(self, ws, msg: Dict[str, Any]) -> None:
+        """Routes a MSG_DIRECT to either a local user (USER_DELIVER) or next hop (SERVER_DELIVER)
 
         Args:
             ws (WebSocketCommonProtocol): User socket
             msg (Dict[str, Any]): MSG_PRIVATE frame
         """
 
-        frm = msg.get("from"); to = msg.get("to"); pl = msg.get("payload", {})
+        frm = msg.get("from"); to = msg.get("to"); pl = msg.get("payload", {}) or {}
         loc = self.user_locations.get(to)
+
         if loc == "local":
             await self._deliver_to_local_user(to, {
+                "ciphertext": pl.get("ciphertext"),
+                "sender": frm,
+                "sender_pub": pl.get("sender_pub"),
+                "content_sig": pl.get("content_sig",""),
+                "content_ts": msg.get("ts"),
+            })
+            return
+
+        if isinstance(loc, str) and loc.startswith(("server_", "master_server_")):
+            lk = self.servers.get(loc)
+            if not lk:
+                await self._send_error(ws, E_TIMEOUT, f"no link to {loc}")
+                return
+            hop = make_env(T_SERVER_DELIVER, self.server_uuid, loc, {
                 "user_id": to,
                 "ciphertext": pl.get("ciphertext"),
                 "sender": frm,
                 "sender_pub": pl.get("sender_pub"),
-                "content_sig": pl.get("content_sig", ""),
+                "content_sig": pl.get("content_sig",""),
                 "content_ts": msg.get("ts"),
-            })
-        elif isinstance(loc, str) and (loc.startswith("master_server_") or loc.startswith("server_")):
-            lk = self.servers.get(loc)
-            if lk:
-                peer_msg = make_env(T_PEER_DELIVER, self.server_uuid, loc, {
-                    "user_id": to,
-                    "ciphertext": pl.get("ciphertext"),
-                    "sender": frm,
-                    "sender_pub": pl.get("sender_pub"),
-                    "content_sig": pl.get("content_sig", ""),
-                    "content_ts": msg.get("ts"),
-                }, self.keys)
-                await self._send_raw(lk.ws, peer_msg)
-            else:
-                await self._send_error(ws, E_TIMEOUT, f"no link to {loc}")
-        else:
-            await self._send_error(ws, E_USER_NOT_FOUND, f"unknown location for {to}")
+            }, self.keys)
+            await self._send_raw(lk.ws, hop)
+            return
+
+        await self._send_error(ws, E_USER_NOT_FOUND, f"unknown location for {to}")
 
     async def _on_public_from_user(self, ws, msg) -> None:
-        """Handles T_PUBLIC_POST from a local user: deliver to locals and fan-out to peers.
+        """Handles T_MSG_PUBLIC_CHANNEL from a local user: deliver to locals and fan-out to peers.
 
         Args:
             ws: WebSocket of the sender (unused except for potential errors).
@@ -733,26 +759,22 @@ class SOCPServer:
         """
         
         pl = msg.get("payload", {}) or {}
+
+        # (optional) dedupe using (from|ts) like you already do
         post_id = f"{pl.get('from')}|{pl.get('ts')}"
         if post_id in self.seen_public:
             return
         self.seen_public.add(post_id)
 
-        # Deliver to all local users (including sender; client ignores own echo)
+        # Deliver to locals as v1.3
         for uid, lk in list(self.local_users.items()):
-            try:
-                env = make_env(T_PUBLIC_POST, self.server_uuid, uid, pl, self.keys)
-                await self._send_raw(lk.ws, env)
-            except Exception:
-                pass
+            env = make_env(T_MSG_PUBLIC_CHANNEL, self.server_uuid, uid, pl, self.keys)
+            await self._send_raw(lk.ws, env)
 
-        # Fan-out to all peers
+        # Fan-out to peers as v1.3
         for peer_id, link in list(self.servers.items()):
-            try:
-                envp = make_env(T_PUBLIC_POST, self.server_uuid, peer_id, pl, self.keys)
-                await self._send_raw(link.ws, envp)
-            except Exception:
-                pass
+            envp = make_env(T_MSG_PUBLIC_CHANNEL, self.server_uuid, peer_id, pl, self.keys)
+            await self._send_raw(link.ws, envp)
 
     async def _on_user_db_get(self, ws: websockets.WebSocketCommonProtocol, msg: Dict[str, Any]) -> None:
         """Handles a user request to fetch another user's pubkey (via Master)
@@ -864,37 +886,30 @@ class SOCPServer:
     # -------- Public Channel --------
 
     async def _on_public_from_peer(self, msg: dict) -> None:
-        """Handles T_PUBLIC_POST from a peer: deliver to locals and re-fan-out to other peers.
+        """Handles T_MSG_PUBLIC_CHANNEL from a peer: deliver to locals and re-fan-out to other peers.
 
         Args:
             msg (dict): Peer envelope.
         """
 
         pl = msg.get("payload", {}) or {}
-        src_peer = msg.get("from")  # the peer server UUID we received from
+        src_peer = msg.get("from")
         post_id = f"{pl.get('from')}|{pl.get('ts')}"
-
         if post_id in self.seen_public:
             return
         self.seen_public.add(post_id)
 
-        # Deliver to all local users
+        # Deliver to locals as v1.3
         for uid, lk in list(self.local_users.items()):
-            try:
-                env = make_env(T_PUBLIC_POST, self.server_uuid, uid, pl, self.keys)
-                await self._send_raw(lk.ws, env)
-            except Exception:
-                pass
+            env = make_env(T_MSG_PUBLIC_CHANNEL, self.server_uuid, uid, pl, self.keys)
+            await self._send_raw(lk.ws, env)
 
-        # Re-fan-out to other peers (avoid bouncing back to the sender peer)
+        # Re-fan-out to other peers as v1.3 (don’t bounce to src)
         for peer_id, link in list(self.servers.items()):
             if peer_id == src_peer:
                 continue
-            try:
-                envp = make_env(T_PUBLIC_POST, self.server_uuid, peer_id, pl, self.keys)
-                await self._send_raw(link.ws, envp)
-            except Exception:
-                pass
+            envp = make_env(T_MSG_PUBLIC_CHANNEL, self.server_uuid, peer_id, pl, self.keys)
+            await self._send_raw(link.ws, envp)
 
     # -------- Files --------
 

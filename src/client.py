@@ -129,21 +129,20 @@ class SOCPClient:
                 for u in users:
                     print(f" - {u}")
 
-            elif t == T_PUBLIC_POST:
+            elif t == T_MSG_PUBLIC_CHANNEL:
                 p = pl
-                # Verify signature over canonical content
                 content_obj = {
-                    "channel": p.get("channel", "public"),
-                    "text": p.get("text", ""),
+                    "channel": p.get("channel"),
+                    "text": p.get("text"),
                     "from": p.get("from"),
                     "ts": p.get("ts"),
                 }
-                ok = RSAKeys.verify_payload(p.get("sender_pub", ""), content_obj, p.get("content_sig", ""))
-                # Ignore our own echo (we already print “[you ->  Public Channel] ...”)
+                ok = RSAKeys.verify_payload(p.get("sender_pub",""), content_obj, p.get("content_sig",""))
                 if p.get("from") == self.user_uuid:
                     continue
                 badge = "🔐" if ok else "⚠️"
-                print(f"[Public Channel] {badge} {p.get('from')}: {p.get('text')}")
+                # If your public messages are plaintext, change printed field accordingly
+                print(f"[Public Channel] {badge} {p.get('from')}: {p.get('text') or '<encrypted>'}")
                 
             elif t == T_FILE_START:
                 await self._handle_file_start(pl)      # sets up recv_files[file_id]
@@ -327,7 +326,7 @@ class SOCPClient:
         content_sig = self.keys.sign_payload(content_obj)
 
         env = {
-            "type": T_MSG_PRIVATE,
+            "type": T_MSG_DIRECT,
             "from": self.user_uuid,
             "to":   target,
             "ts":   ts,
@@ -368,7 +367,7 @@ class SOCPClient:
             "content_sig": content_sig,
         }
         env = {
-            "type": "PUBLIC_POST",
+            "type": T_MSG_PUBLIC_CHANNEL,
             "from": self.user_uuid,
             "to": "server_*",
             "ts": ts,
