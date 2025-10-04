@@ -126,16 +126,6 @@ The system ensures:
 - Authentication: Every user and server has a unique RSA-4096 key.
 - Non-repudiation: Senders cannot deny sending a signed message.
 
-Message Envelope:
-{
-  "type": "MSG_PRIVATE",
-  "from": "Alice",
-  "to": "Bob",
-  "ts": 1698720000000,
-  "payload": { ... },
-  "sig": "<RSA-PSS signature>"
-}
-
 ---------------------------------------------------------
 Reset and Cleanup
 ---------------------------------------------------------

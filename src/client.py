@@ -24,8 +24,8 @@ SOCP Client (v1.3)
 
 - Connects to one local server over WebSocket
 - Sends USER_HELLO on connect
-- Commands: /help, /pubget, /dbget <user>, /tell <user> <text>, /quit
-- DMs: AES-256-GCM + RSA-OAEP(SHA-256) for the key, RSASSA-PSS(SHA-256) signature
+- Commands: /help, /pubget, /dbget <user>, /tell <user> <text>, /all <text>, /file <user> <path>, /quit
+- DMs: RSA-OAEP(SHA-256) for the key, RSASSA-PSS(SHA-256) signature
 """
 
 class SOCPClient:
