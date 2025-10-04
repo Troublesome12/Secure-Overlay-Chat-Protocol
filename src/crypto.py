@@ -1,43 +1,90 @@
+# crypto.py
 from __future__ import annotations
 
 import pathlib
-
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Iterator, Tuple
 
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asy_padding
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from encoding import b64u_encode, b64u_decode, canonical_json_bytes
 
-
-"""Cryptographic primitives for SOCP
-
-- RSA-4096 keys for signatures (RSASSA-PSS/SHA-256) and key wrapping (RSA-OAEP/SHA-256)
-- AES-256-GCM for content confidentiality/integrity (AEAD).
-- Public keys encoded as DER(SPKI) then base64url (no padding) for JSON transport
 """
+Cryptographic primitives for SOCP v1.3 (RSA-only)
+
+This module provides:
+- RSAKeys: Key management for an RSA-4096 keypair (load-or-create),
+           public-key export (DER->base64url), and payload signing/verify
+           using RSASSA-PSS(SHA-256).
+- RSA-OAEP(SHA-256) helpers:
+    * rsa_encrypt(pub_der_b64u, plaintext: bytes) -> base64url
+    * rsa_decrypt(priv, ciphertext_b64u: str) -> bytes
+    * rsa_chunk_iter(data: bytes, chunk_size: int = 446) -> (index, chunk)
+      (446 is the safe max single-block OAEP payload for 4096-bit RSA with SHA-256)
+
+Design notes:
+- We use **RSA-4096** for both *signatures* (PSS/SHA-256) and *confidentiality*
+  (OAEP/SHA-256). This is intentionally simple for the project and matches your
+  “RSA-only” v1.3 requirement. If you later reintroduce hybrid crypto, add an
+  AEAD (e.g., AES-256-GCM) and only wrap the symmetric key with RSA-OAEP.
+- Public keys are transported as DER(SPKI) encoded with **base64url (no padding)**
+  for convenient JSON embedding.
+"""
+
+
+__all__ = [
+    "RSAKeys",
+    "rsa_encrypt",
+    "rsa_decrypt",
+    "rsa_chunk_iter",
+    "RSA4096_OAEP_MAX",
+]
+
+# --- RSA-4096 OAEP(SHA-256) single-block plaintext size -----------------------
+# For RSA modulus n = 4096 bits => 512 bytes.
+# OAEP with SHA-256: max message length = k - 2*hLen - 2
+#   where k = 512, hLen = 32 (SHA-256 digest size)
+# => 512 - 2*32 - 2 = 446 bytes
+RSA4096_BYTES = 512
+SHA256_LEN = 32
+RSA4096_OAEP_MAX = RSA4096_BYTES - 2 * SHA256_LEN - 2  # 446
+
 
 @dataclass
 class RSAKeys:
-    """Container for an RSA-4096 private/public keypair"""
+    """
+    Container for an RSA-4096 private/public keypair used in SOCP v1.3.
 
+    Responsibilities:
+    - Persist/restore the private key in PKCS#8 PEM format (unencrypted file).
+    - Export public key as DER(SPKI) ➝ base64url for JSON transport.
+    - Sign/verify canonicalized JSON payloads with RSASSA-PSS(SHA-256).
+
+    Example:
+        >>> keys = RSAKeys.load_or_create(Path("data/user.pem"))
+        >>> pub_b64 = keys.pub_der_b64u()
+        >>> sig = keys.sign_payload({"msg":"hi", "ts":123})
+        >>> RSAKeys.verify_payload(pub_b64, {"msg":"hi", "ts":123}, sig)
+        True
+    """
     priv: rsa.RSAPrivateKey
     pub: rsa.RSAPublicKey
 
+    # ---- Construction / Persistence -----------------------------------------
+
     @staticmethod
-    def load_or_create(path: pathlib.Path, bits: int = 4096) -> RSAKeys:
-        """Loads an RSA private key from PEM, or creates and saves one if missing
+    def load_or_create(path: pathlib.Path, bits: int = 4096) -> "RSAKeys":
+        """
+        Load an RSA private key from PEM; create and save one if missing.
 
         Args:
-            path (pathlib.Path): Filesystem path of the PEM file
-            bits (int): Key size in bits (default 4096)
+            path: Filesystem path of the PEM file.
+            bits: Key size in bits (default 4096).
 
         Returns:
-            RSAKeys: Wrapper with loaded or newly generated keypair
+            RSAKeys: wrapper holding the private/public keypair.
         """
-
         if path.exists():
             data = path.read_bytes()
             priv = serialization.load_pem_private_key(data, password=None)
@@ -52,58 +99,68 @@ class RSAKeys:
             path.write_bytes(pem)
         return RSAKeys(priv=priv, pub=priv.public_key())
 
+    # ---- Public key export ---------------------------------------------------
+
     def pub_der_b64u(self) -> str:
-        """Exports the public key as DER(SPKI) encoded with base64url (no padding)
+        """
+        Export the public key as DER(SPKI), encoded with base64url (no padding).
 
         Returns:
-            str: Base64url-encoded DER public key
+            Base64url string suitable for JSON transport.
         """
-
         der = self.pub.public_bytes(
             encoding=serialization.Encoding.DER,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
         return b64u_encode(der)
 
+    # ---- Sign / Verify (RSASSA-PSS, SHA-256) --------------------------------
+
     def sign_payload(self, payload_obj: Any) -> str:
-        """Signs a JSON-serializable payload (canonicalized) with RSASSA-PSS/SHA-256
+        """
+        Sign a JSON-serializable payload using RSASSA-PSS(SHA-256).
+
+        The payload is first canonicalized via `encoding.canonical_json_bytes`
+        to ensure stable bytes over the wire (key order, separators).
 
         Args:
-            payload_obj (Any): Object serialized via `canonical_json_bytes()`
+            payload_obj: Any JSON-serializable object.
 
         Returns:
-            str: Base64url signature
+            Base64url signature string.
         """
-
         sig = self.priv.sign(
             canonical_json_bytes(payload_obj),
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            asy_padding.PSS(
+                mgf=asy_padding.MGF1(hashes.SHA256()),
+                salt_length=asy_padding.PSS.MAX_LENGTH,
+            ),
             hashes.SHA256(),
         )
         return b64u_encode(sig)
 
     @staticmethod
     def verify_payload(pub_der_b64u: str, payload_obj: Any, sig_b64u: str) -> bool:
-        """Verifies a payload signature using the provided DER(SPKI) public key
+        """
+        Verify a payload signature using the given public key.
 
         Args:
-            pub_der_b64u (str): Base64url DER(SPKI) public key
-            payload_obj (Any): Object serialized via `canonical_json_bytes()`
-            sig_b64u (str): Base64url signature to verify
+            pub_der_b64u: Public key as DER(SPKI) base64url.
+            payload_obj:  The JSON-serializable object that was signed.
+            sig_b64u:     Base64url signature string to verify.
 
         Returns:
-            bool: True if the signature is valid; False otherwise
-
-        Raises:
-            Exception: On malformed inputs (caught and returned as False)
+            True if signature is valid; False otherwise.
         """
-
         try:
             pub = serialization.load_der_public_key(b64u_decode(pub_der_b64u))
             pub.verify(
                 b64u_decode(sig_b64u),
                 canonical_json_bytes(payload_obj),
-                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+                asy_padding.PSS(
+                    mgf=asy_padding.MGF1(hashes.SHA256()),
+                    salt_length=asy_padding.PSS.MAX_LENGTH,
+                ),
                 hashes.SHA256(),
             )
             return True
@@ -111,58 +168,74 @@ class RSAKeys:
             return False
 
 
-# ---- End-to-end helpers (AES-256-GCM + RSA-OAEP) --------------------------------
+# ---- RSA-OAEP(SHA-256) convenience helpers ----------------------------------
 
+def rsa_chunk_iter(data: bytes, chunk_size: int = RSA4096_OAEP_MAX) -> Iterator[Tuple[int, bytes]]:
+    """
+    Yield `(index, chunk)` slices of `data` that fit a single RSA-OAEP block.
 
-def e2e_encrypt_for(recipient_pub_der_b64u: str, plaintext: bytes) -> Dict[str, str]:
-    """Encrypts `plaintext` for a recipient using AES-256-GCM and RSA-OAEP key wrap
+    Use this when you need to encrypt arbitrarily long byte streams by
+    sending multiple RSA-OAEP blocks.
 
     Args:
-        recipient_pub_der_b64u (str): Recipient public key in base64url DER(SPKI)
-        plaintext (bytes): Message bytes to encrypt
+        data:       Raw bytes to split.
+        chunk_size: Max OAEP block payload (default 446 for RSA-4096 + SHA-256).
 
-    Returns:
-        Dict[str, str]: JSON-ready fields (all base64url, no padding):
-            {
-              "ciphertext": ...,
-              "iv": ...,
-              "tag": ...,
-              "wrapped_key": ...
-            }
+    Yields:
+        (index, chunk) pairs where `index` starts at 0.
     """
+    for i in range(0, len(data), chunk_size):
+        yield (i // chunk_size, data[i:i + chunk_size])
 
-    import os
-    key = os.urandom(32)
-    iv  = os.urandom(12)
-    ct_tag = AESGCM(key).encrypt(iv, plaintext, None)
-    ciphertext, tag = ct_tag[:-16], ct_tag[-16:]
-    pub = serialization.load_der_public_key(b64u_decode(recipient_pub_der_b64u))
-    wrapped_key = pub.encrypt(
-        key,
-        padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-    )
-    return {
-        "ciphertext": b64u_encode(ciphertext),
-        "iv":         b64u_encode(iv),
-        "tag":        b64u_encode(tag),
-        "wrapped_key":b64u_encode(wrapped_key),
-    }
 
-def e2e_decrypt_with(privkey: rsa.RSAPrivateKey, bundle: Dict[str, str]) -> bytes:
-    """Decrypts an AES-256-GCM bundle using RSA-OAEP-wrapped key
+def rsa_encrypt(pub_der_b64u: str, plaintext: bytes) -> str:
+    """
+    Encrypt a small blob with RSA-4096 OAEP(SHA-256) -> base64url ciphertext.
+
+    Note:
+        For large payloads, split first with `rsa_chunk_iter()` and encrypt each
+        chunk separately.
 
     Args:
-        privkey (rsa.RSAPrivateKey): Recipient RSA private key
-        bundle (Dict[str, str]): Fields from `e2e_encrypt_for`: ciphertext, iv, tag, wrapped_key
+        pub_der_b64u: Recipient public key (DER(SPKI) base64url).
+        plaintext:    Bytes to encrypt (<= 446B per block).
 
     Returns:
-        bytes: Decrypted plaintext
+        Base64url-encoded ciphertext.
     """
-
-    key = privkey.decrypt(
-        b64u_decode(bundle["wrapped_key"]),
-        padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    pub = serialization.load_der_public_key(b64u_decode(pub_der_b64u))
+    ct = pub.encrypt(
+        plaintext,
+        asy_padding.OAEP(
+            mgf=asy_padding.MGF1(hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
     )
-    iv = b64u_decode(bundle["iv"])
-    ct = b64u_decode(bundle["ciphertext"]) + b64u_decode(bundle["tag"])
-    return AESGCM(key).decrypt(iv, ct, None)
+    return b64u_encode(ct)
+
+
+def rsa_decrypt(priv: rsa.RSAPrivateKey, ciphertext_b64u: str) -> bytes:
+    """
+    Decrypt an RSA-4096 OAEP(SHA-256) base64url ciphertext -> bytes.
+
+    Args:
+        priv:              Recipient private key.
+        ciphertext_b64u:   Base64url-encoded ciphertext.
+
+    Returns:
+        Decrypted plaintext bytes.
+
+    Raises:
+        Exception on malformed ciphertext or verify failure.
+    """
+    ct = b64u_decode(ciphertext_b64u)
+    pt = priv.decrypt(
+        ct,
+        asy_padding.OAEP(
+            mgf=asy_padding.MGF1(hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return pt

@@ -11,13 +11,22 @@
 - **Aditya Dixit** - a1980937  
 - **Hasnain Habib Sayed** - a1988079  
 - **Sukarna Paul** - a1986887
-- **Atiq Ullah Ador** - a1989573 
+- **Atiq Ullah Ador** - a1989573
+
+**PoC:** 
+- **Name:** Aditya Dixit
+- **Email:** a1980937@adelaide.edu.au
+- **Phone:** 0478614602
 
 ## Features
-- **Server (mesh peer)**: `server_uuid`, presence gossip (`USER_ADVERTISE`/`USER_REMOVE`), DM routing (`PEER_DELIVER`/`USER_DELIVER`), error frames.
-- **Master DB**: single authority (configurable by `--master-uuid`) for user registry & pubkey lookup. Locals proxy via DB-RPC.
-- **Client**: users attach to one local server; DMs are **E2E encrypted** (AES‑256‑GCM; RSA‑OAEP key wrap) and **content‑signed** (RSA‑PSS).
-- **Security**: RSA‑4096, SHA‑256, base64url (no padding), canonical JSON signing.
+- **Server (mesh peer)**: Handles peer linking (`PEER_HELLO_LINK`), user presence gossip (`USER_ADVERTISE` / `USER_REMOVE`), and DM routing (`PEER_DELIVER` / `USER_DELIVER`).
+- **Master DB**: Single authority (configurable by `--master-uuid`) for user registry & pubkey lookup. Locals proxy DB-RPC requests to the Master.
+- **Client**: Users attach to one local server; DMs are **RSA-encrypted** (OAEP-SHA256) and **content‑signed** (RSA-PSS-SHA256).
+- **Security**: Pure RSA-4096 cryptography — no AES keywrap — using SHA-256, base64url (no padding), and canonical JSON signing.
+
+<br>
+
+> VULNERABILITY INJECTED — FOR STUDY PURPOSE
 
 ## Project Tree
 ```
@@ -79,20 +88,20 @@ python3 src/main.py client --user-uuid Bob --server ws://127.0.0.1:9102
 
 ### Client commands
 ```
-/help                                               # list all available commands
-/list                                               # fetch & display known online users (sorted)
-/pubget                                             # print your own public key (SPKI DER base64url)
-/dbget <user_uuid>                                  # fetch & cache <user>'s pubkey via Master (run before /tell)
-/tell <user_uuid> <text>                            # send E2E-encrypted DM (AES-256-GCM + RSA-OAEP wrap + RSA-PSS signature)
-/all <text>                                         # post to the mesh-wide public channel (authentic, not confidential)
-/file <user_uuid|public> <file_path>                # send file: DM wraps per-file AES; 'public' broadcasts to all (no confidentiality)
-/quit                                               # close the WebSocket and exit
+/help                                               # list all commands
+/list                                               # show all online users
+/pubget                                             # print your own public key
+/dbget <user_uuid>                                  # fetch and cache a user's public key
+/tell <user_uuid> <text>                            # send RSA-OAEP encrypted + RSA-PSS signed DM
+/all <text>                                         # post public message (signed only)
+/file <user_uuid|public> <file_path>                # send file (RSA-OAEP per recipient; plaintext for public)
+/quit                                               # close the client
 ```
 
 ### Message Flow
 
 ```bash
-# --- DM  ---
+# --- DM (E2E) ---
 
 # In Alice client:
 /dbget Bob                                   # learn Bob's pubkey (one-time)
@@ -128,18 +137,53 @@ python3 src/main.py client --user-uuid Bob --server ws://127.0.0.1:9102
 Use the helper script to reset local state between runs.
 
 ```bash
-# Make the script executable (one-time)
-chmod +x clean.sh
-
-# Clean state (keeps Master identity: keys/master.uuid + its PEM)
-./clean.sh
-
-# Full reset (also deletes Master identity)
-./clean.sh --nuke-master
+chmod +x clean.sh           # Make the script executable (one-time)
+./clean.sh                  # reset local runtime (preserves master identity)
+./clean.sh --nuke-master    # Full reset  (deletes master identity too)
 ```
 
-## SOCP Compliance
-- Envelope: `{type, from, to, ts(ms), payload, sig}`, with `sig = RSA‑PSS(SHA‑256)` over **canonical `payload`** only.
-- Crypto: RSA‑4096 (PSS & OAEP), AES‑256‑GCM, SHA‑256, **base64url (no padding)** for all binary values.
-- Transport: WebSocket text frames (one JSON per frame).
-- Master selection: **`--role master`** makes that node Master forever (UUID persisted). Locals auto-load the Master UUID from `keys/master.uuid` or `--master-uuid`.
+## SOCP Compliance (v1.3)
+
+<table>
+  <thead>
+    <tr>
+      <th style="text-align:center;">Layer</th>
+      <th style="text-align:center;">Mechanism</th>
+    </tr>
+  </thead>
+  <tbody>
+  <tr>
+      <td style="text-align:left;">Envelope</td>
+      <td style="text-align:left;"><code>{type, from, to, ts(ms), payload, sig}</code></td>
+    </tr>
+    <tr>
+      <td style="text-align:left;">Signature</td>
+      <td style="text-align:left;">RSA-PSS(SHA-256) over canonical <code>payload</code></td>
+    </tr>
+    <tr>
+      <td style="text-align:left;">Encryption (DMs)</td>
+      <td style="text-align:left;">RSA-4096 OAEP(SHA-256) — no AES hybrid</td>
+    </tr>
+    <tr>
+      <td style="text-align:left;">Hashing</td>
+      <td style="text-align:left;">SHA-256</td>
+    </tr>
+    <tr>
+      <td style="text-align:left;">Encoding</td>
+      <td style="text-align:left;">base64url (no padding) for all binary fields</td>
+    </tr>
+    <tr>
+      <td style="text-align:left;">Transport</td>
+      <td style="text-align:left;">WebSocket (JSON text frames)</td>
+    </tr>
+    <tr>
+      <td style="text-align:left;">Identity</td>
+      <td style="text-align:left;"><code>--role</code> master designates permanent Master (UUID persisted)</td>
+    </tr>
+  </tbody>
+</table><br>
+
+
+## Version Notes
+- v1.0 – v1.2: AES-GCM hybrid encryption (deprecated).
+- v1.3: Fully RSA-based — simplified key management, stronger signature discipline, and reduced dependencies.

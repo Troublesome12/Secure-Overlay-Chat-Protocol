@@ -702,9 +702,6 @@ class SOCPServer:
             await self._deliver_to_local_user(to, {
                 "user_id": to,
                 "ciphertext": pl.get("ciphertext"),
-                "iv": pl.get("iv"),
-                "tag": pl.get("tag"),
-                "wrapped_key": pl.get("wrapped_key"),
                 "sender": frm,
                 "sender_pub": pl.get("sender_pub"),
                 "content_sig": pl.get("content_sig", ""),
@@ -716,9 +713,6 @@ class SOCPServer:
                 peer_msg = make_env(T_PEER_DELIVER, self.server_uuid, loc, {
                     "user_id": to,
                     "ciphertext": pl.get("ciphertext"),
-                    "iv": pl.get("iv"),
-                    "tag": pl.get("tag"),
-                    "wrapped_key": pl.get("wrapped_key"),
                     "sender": frm,
                     "sender_pub": pl.get("sender_pub"),
                     "content_sig": pl.get("content_sig", ""),

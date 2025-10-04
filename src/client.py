@@ -12,11 +12,12 @@ import websockets
 
 from pathlib import Path
 from protocols import *
-from crypto import RSAKeys, e2e_encrypt_for, e2e_decrypt_with
+from crypto import  RSAKeys, rsa_encrypt, rsa_decrypt, rsa_chunk_iter
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 from encoding import b64u_encode, b64u_decode
+
 
 """
 SOCP Client (v1.3)
@@ -82,7 +83,6 @@ class SOCPClient:
         """
 
         assert self.ws
-        from crypto import e2e_decrypt_with
         async for raw in self.ws:
             try: msg = json.loads(raw)
             except Exception: continue
@@ -90,32 +90,29 @@ class SOCPClient:
             pl = msg.get("payload", {})
             
             if t == T_USER_DELIVER:
-                if "wrapped_key" not in pl:
-                    print("[dm] malformed frame (missing wrapped_key) — ignored")
-                    continue
+                sender = pl.get("sender")
+                sender_pub = pl.get("sender_pub", "")
 
-                sender = pl.get("sender"); sender_pub = pl.get("sender_pub", "")
-                # Optional content signature verification
+                # Verify signature over minimal canonical fields (no iv/tag/wrapped_key)
                 verified = False
                 try:
-                    from crypto import RSAKeys as _Keys
                     content_obj = {
                         "ciphertext": pl.get("ciphertext"),
-                        "iv": pl.get("iv"),
-                        "tag": pl.get("tag"),
                         "from": sender,
                         "to":   self.user_uuid,
                         "ts":   pl.get("content_ts", msg.get("ts")),
                     }
-                    verified = _Keys.verify_payload(sender_pub, content_obj, pl.get("content_sig",""))
+                    verified = RSAKeys.verify_payload(sender_pub, content_obj, pl.get("content_sig",""))
                 except Exception:
                     verified = False
-                # Decrypt
+
+                # Decrypt with our RSA private key
                 try:
-                    pt = e2e_decrypt_with(self.keys.priv, pl)
-                    text = pt.decode('utf-8', errors='replace')
+                    pt = rsa_decrypt(self.keys.priv, pl["ciphertext"])
+                    text = pt.decode("utf-8", errors="replace")
                 except Exception as e:
                     text = f"<decrypt failed: {e}>"
+
                 badge = "🔐" if verified else "⚠️"
                 print(f"[dm from {sender}] {badge} {text}")
 
@@ -135,14 +132,13 @@ class SOCPClient:
             elif t == T_PUBLIC_POST:
                 p = pl
                 # Verify signature over canonical content
-                from crypto import RSAKeys as _Keys
                 content_obj = {
                     "channel": p.get("channel", "public"),
                     "text": p.get("text", ""),
                     "from": p.get("from"),
                     "ts": p.get("ts"),
                 }
-                ok = _Keys.verify_payload(p.get("sender_pub", ""), content_obj, p.get("content_sig", ""))
+                ok = RSAKeys.verify_payload(p.get("sender_pub", ""), content_obj, p.get("content_sig", ""))
                 # Ignore our own echo (we already print “[you ->  Public Channel] ...”)
                 if p.get("from") == self.user_uuid:
                     continue
@@ -198,9 +194,9 @@ class SOCPClient:
                     ("/list",                                   "fetch & display known online users (sorted)"),
                     ("/pubget",                                 "print your own public key (SPKI DER base64url)"),
                     ("/dbget <user_uuid>",                      "fetch & cache <user>'s pubkey via Master (run before /tell)"),
-                    ("/tell <user_uuid> <text>",                "send E2E-encrypted DM (AES-256-GCM + RSA-OAEP wrap + RSA-PSS signature)"),
+                    ("/tell <user_uuid> <text>",                "send E2E-encrypted DM (RSA-4096 OAEP + RSA-PSS signature)"),
                     ("/all <text>",                             "post to the mesh-wide public channel (authentic, not confidential)"),
-                    ("/file <user_uuid|public> <file_path>",    "send file: DM wraps per-file AES key; 'public' is broadcast (no secrecy)"),
+                    ("/file <user_uuid|public> <file_path>",    "send file: DM per-chunk RSA; 'public' = plaintext (signed manifest)"),
                     ("/quit",                                   "close the WebSocket and exit"),
                 ]
                 col = max(len(cmd) for cmd, _ in help_items) + 2
@@ -318,28 +314,29 @@ class SOCPClient:
         if target not in self.keyring:
             print("unknown recipient key; try /dbget <user> first")
             return
-        bundle = e2e_encrypt_for(self.keyring[target], text.encode('utf-8'))
+
+        ts = int(time.time() * 1000)
+        ciphertext = rsa_encrypt(self.keyring[target], text.encode("utf-8"))
+
         content_obj = {
-            "ciphertext": bundle["ciphertext"],
-            "iv": bundle["iv"],
-            "tag": bundle["tag"],
+            "ciphertext": ciphertext,
             "from": self.user_uuid,
             "to": target,
-            "ts": int(time.time()*1000),
+            "ts": ts,
         }
         content_sig = self.keys.sign_payload(content_obj)
-        payload = {
-            **bundle, 
-            "sender_pub": self.keys.pub_der_b64u(), 
-            "content_sig": content_sig,
-            "content_ts": content_obj["ts"]
-        }
+
         env = {
             "type": T_MSG_PRIVATE,
             "from": self.user_uuid,
             "to":   target,
-            "ts":   content_obj["ts"],
-            "payload": payload,
+            "ts":   ts,
+            "payload": {
+                "ciphertext": ciphertext,
+                "sender_pub": self.keys.pub_der_b64u(),
+                "content_sig": content_sig,
+                "content_ts": ts,
+            },
             "sig": "",
         }
         await self.ws.send(json.dumps(env, separators=(',',':')))
@@ -382,97 +379,97 @@ class SOCPClient:
         print(f"[you ->  Public Channel] {text}")
 
     async def _fsend(self, target: str, path: pathlib.Path) -> None:
-        """Send a file either as a DM (AES-256-GCM + RSA-OAEP wrapped key)
-        or to the Public Channel (AES-256-GCM; per-file key published in FILE_START).
+        """Send file: RSA-OAEP only (no AES). DM = per-chunk RSA; Public = plaintext.
 
         - DM: include `wrapped_key` in EVERY chunk (receiver expects it per-chunk).
         - Public: include `pub_key` (base64url AES key) in FILE_START; no wrapped_key in chunks.
         - Manifest is signed (v1.3) with RSASSA-PSS over canonical fields.
         """
 
-        async with self._send_lock:  # prevents overlapping/double invocations
-            if not path.exists() or not path.is_file():
-                print("file not found")
-                return
+        if not path.exists() or not path.is_file():
+            print("file not found"); return
 
-            data = path.read_bytes()
-            sha = hashlib.sha256(data).hexdigest()
-            ts = int(time.time() * 1000)
-            file_id = str(uuid.uuid4())
+        data = path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        ts = int(time.time() * 1000)
+        file_id = str(uuid.uuid4())
 
-            is_public = (target.lower() == "public")
-            mode = "public" if is_public else "dm"
-            to_field = "public" if is_public else target
+        is_public = (target.lower() == "public")
+        mode = "public" if is_public else "dm"
+        to_field = "public" if is_public else target
 
-            # Per-file AES key
-            file_key = os.urandom(32)
+        # For DM ensure we have recip key
+        if not is_public and target not in self.keyring:
+            print("unknown recipient key; run /dbget <user> first"); return
 
-            # Manifest (FILE_START) with signature
-            pl_start = {
-                "file_id": file_id,
-                "name": path.name,
-                "size": len(data),
-                "sha256": sha,
-                "mode": mode,
-                "sender": self.user_uuid,
-                "ts": ts,
-            }
+        # Manifest (no AES pub_key etc). We still sign the manifest for integrity/authenticity.
+        pl_start = {
+            "file_id": file_id,
+            "name": path.name,
+            "size": len(data),
+            "sha256": sha,
+            "mode": mode,
+            "sender": self.user_uuid,
+            "ts": ts,
+            "sender_pub": self.keys.pub_der_b64u(),
+        }
+        manifest_to_sign = {
+            "file_id": file_id,
+            "name": path.name,
+            "size": len(data),
+            "sha256": sha,
+            "mode": mode,
+            "sender": self.user_uuid,
+            "ts": ts,
+        }
+        pl_start["content_sig"] = self.keys.sign_payload(manifest_to_sign)
+
+        env_start = {
+            "type": T_FILE_START,
+            "from": self.user_uuid,
+            "to": to_field,
+            "ts": ts,
+            "payload": pl_start,
+            "sig": "",
+        }
+        await self.ws.send(json.dumps(env_start, separators=(",", ":")))
+
+        # Chunk & send
+        # Max safe payload per RSA chunk depends on padding; assume rsa_chunk_iter enforces it.
+        for idx, chunk in rsa_chunk_iter(data) if not is_public else enumerate([data], start=0) if len(data) == 0 else enumerate([data[i:i+4096] for i in range(0, len(data), 4096)], start=0):
             if is_public:
-                pl_start["pub_key"] = b64u_encode(file_key)
+                # plaintext (base64) chunk
+                ct = b64u_encode(chunk)
+            else:
+                ct = rsa_encrypt(self.keyring[target], chunk)
 
-            manifest_to_sign = {
-                "file_id": file_id, "name": path.name, "size": len(data),
-                "sha256": sha, "mode": mode, "sender": self.user_uuid, "ts": ts
+            pl_chunk = {
+                "file_id": file_id,
+                "index": idx,
+                "ciphertext": ct,
+                # no iv/tag/wrapped_key
             }
-            pl_start["sender_pub"] = self.keys.pub_der_b64u()
-            pl_start["content_sig"] = self.keys.sign_payload(manifest_to_sign)
+            env_chunk = {
+                "type": T_FILE_CHUNK,
+                "from": self.user_uuid,
+                "to": to_field,
+                "ts": int(time.time() * 1000),
+                "payload": pl_chunk,
+                "sig": "",
+            }
+            await self.ws.send(json.dumps(env_chunk, separators=(",", ":")))
 
-            env_start = {"type": T_FILE_START, "from": self.user_uuid, "to": to_field,
-                        "ts": ts, "payload": pl_start, "sig": ""}
-            await self.ws.send(json.dumps(env_start, separators=(",", ":")))
-
-            # Encrypt & send chunks
-            CHUNK = 60 * 1024
-            if (not is_public) and target not in self.keyring:
-                print("unknown recipient key; run /dbget <user> first")
-                return
-
-            for i in range(0, len(data), CHUNK):
-                chunk = data[i:i+CHUNK]
-                iv = os.urandom(12)
-                ct_tag = AESGCM(file_key).encrypt(iv, chunk, None)
-                payload = {
-                    "file_id": file_id,
-                    "index": i // CHUNK,
-                    "ciphertext": b64u_encode(ct_tag[:-16]),
-                    "iv": b64u_encode(iv),
-                    "tag": b64u_encode(ct_tag[-16:]),
-                }
-                if not is_public:
-                    from cryptography.hazmat.primitives import serialization, hashes
-                    from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
-                    recip_pub = serialization.load_der_public_key(b64u_decode(self.keyring[target]))
-                    wrapped = recip_pub.encrypt(
-                        file_key,
-                        asy_padding.OAEP(
-                            mgf=asy_padding.MGF1(hashes.SHA256()),
-                            algorithm=hashes.SHA256(),
-                            label=None,
-                        ),
-                    )
-                    payload["wrapped_key"] = b64u_encode(wrapped)
-
-                env_chunk = {"type": T_FILE_CHUNK, "from": self.user_uuid, "to": to_field,
-                            "ts": int(time.time()*1000), "payload": payload, "sig": ""}
-                await self.ws.send(json.dumps(env_chunk, separators=(",", ":")))
-
-            # END
-            env_end = {"type": T_FILE_END, "from": self.user_uuid, "to": to_field,
-                    "ts": int(time.time()*1000), "payload": {"file_id": file_id}, "sig": ""}
-            await self.ws.send(json.dumps(env_end, separators=(",", ":")))
-
-            # Print exactly once per call
-            print(f"[file] sent {path.name} → {'Public Channel' if is_public else target}")
+        # End
+        env_end = {
+            "type": T_FILE_END,
+            "from": self.user_uuid,
+            "to": to_field,
+            "ts": int(time.time() * 1000),
+            "payload": {"file_id": file_id},
+            "sig": "",
+        }
+        await self.ws.send(json.dumps(env_end, separators=(",", ":")))
+        print(f"[file] sent {path.name} → {'Public Channel' if is_public else target}")
 
     async def _handle_file_chunk(self, pl: dict) -> None:
         """Processes a single FILE_CHUNK frame: decrypts the chunk and appends it to the open file
@@ -486,37 +483,25 @@ class SOCPClient:
                 - tag (str): Base64url-encoded 16-byte GCM tag
                 - wrapped_key (str, optional): RSA-OAEP(SHA-256)-wrapped AES key (present in DM mode only)
         """
-        file_id = pl.get("file_id")
-        idx = int(pl.get("index", 0))
-        ciphertext = pl.get("ciphertext")
-        iv = pl.get("iv")
-        tag = pl.get("tag")
-        wrapped_key = pl.get("wrapped_key", None)
 
-        st = self.recv_files.get(file_id)
+        fid = pl.get("file_id"); idx = int(pl.get("index", 0))
+        st = self.recv_files.get(fid)
         if not st:
             print(f"[file] unexpected chunk #{idx}")
             return
 
         try:
             if st["mode"] == "public":
-                # Public: decrypt with per-file key from manifest
-                key = st.get("public_key")
-                if not key:
-                    raise ValueError("missing public_key from FILE_START")
-                ct_tag = b64u_decode(ciphertext) + b64u_decode(tag)
-                pt = AESGCM(key).decrypt(b64u_decode(iv), ct_tag, None)
-            elif wrapped_key:
-                # DM: RSA-OAEP wrapped per-file key
-                pt = e2e_decrypt_with(self.keys.priv, pl)
+                # plaintext: base64url decode and write
+                pt = b64u_decode(pl["ciphertext"])
             else:
-                raise ValueError("no decryption key available for this mode")
+                # DM: RSA decrypt per chunk
+                pt = rsa_decrypt(self.keys.priv, pl["ciphertext"])
 
             st["fh"].write(pt)
             st["received"] += len(pt)
             pct = (st["received"] / max(st["size"], 1)) * 100
             print(f"[file] chunk #{idx+1} ({st['received']}/{st['size']} bytes, {pct:.0f}%)")
-
         except Exception as e:
             print(f"[file] decrypt failed for chunk #{idx}: {e}")
 
@@ -527,69 +512,32 @@ class SOCPClient:
         - DM: keep original filename (e.g., demo.txt)
         - Public: prefix with receiver name (e.g., Alice_demo.txt)
         """
+
         fid    = pl.get("file_id")
         orig   = pl.get("name", f"{fid}.bin")
         size   = pl.get("size", 0)
         mode   = pl.get("mode", "dm")
         sender = pl.get("sender") or "unknown"
-        ts     = pl.get("ts")
 
-        # --- v1.3: verify signed FILE_START manifest
-        sender_pub  = pl.get("sender_pub", "")
-        content_sig = pl.get("content_sig", "")
-        manifest_obj = {
-            "file_id": fid,
-            "name": orig,
-            "size": size,
-            "sha256": pl.get("sha256"),
-            "mode": mode,
-            "sender": sender,
-            "ts": ts,
-        }
-        try:
-            ok = RSAKeys.verify_payload(sender_pub, manifest_obj, content_sig)
-        except Exception:
-            ok = False
-        badge = "🔐" if ok else "⚠️"
-
-        # Name rule: only public gets receiver-name prefix
         name = f"{self.user_uuid}_{orig}" if mode == "public" else orig
 
-        # Ensure downloads dir & avoid clobbering
-        downloads = Path("downloads")
-        downloads.mkdir(parents=True, exist_ok=True)
+        downloads = Path("downloads"); downloads.mkdir(parents=True, exist_ok=True)
         base = downloads / name
         if base.exists():
             stem, suffix = base.stem, base.suffix
             k = 1
             while True:
-                candidate = downloads / f"{stem} ({k}){suffix}"
-                if not candidate.exists():
-                    base = candidate
-                    break
+                cand = downloads / f"{stem} ({k}){suffix}"
+                if not cand.exists():
+                    base = cand; break
                 k += 1
-
-        # Capture per-file key for public mode (if present)
-        public_key = None
-        if mode == "public":
-            pub_key_b64 = pl.get("pub_key") or ""
-            try:
-                public_key = b64u_decode(pub_key_b64)
-            except Exception:
-                public_key = None
 
         fh = open(base, "wb")
         self.recv_files[fid] = {
-            "fh": fh,
-            "path": base,
-            "mode": mode,
-            "size": size,
-            "received": 0,
-            "sender": sender,
-            "public_key": public_key,
+            "fh": fh, "path": base, "mode": mode, "size": size,
+            "received": 0, "sender": sender
         }
-
-        print(f"[file] {badge} from {sender}: start {base.name} ({size} bytes)")
+        print(f"[file] from {sender}: start {base.name} ({size} bytes)")
 
     async def _handle_file_end(self, pl: dict) -> None:
         """Finalizes an incoming file transfer: closes the file handle and reports the saved path."""
