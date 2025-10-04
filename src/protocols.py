@@ -17,6 +17,9 @@ T_DUMP_USERS       = "DUMP_USERS"
 T_ERROR            = "ERROR"
 
 # --- Server <-> Server (unchanged for DM routing & DB) ---
+T_SERVER_HELLO_JOIN = "SERVER_HELLO_JOIN"   # dialer -> acceptor (includes pubkey, addr, role)
+T_SERVER_WELCOME    = "SERVER_WELCOME"      # acceptor -> dialer (confirms uuid, returns acceptor pubkey, addr, role)
+T_SERVER_ANNOUNCE   = "SERVER_ANNOUNCE"     # any -> peers (introduce/refresh a 3rd peer: uuid, pubkey, addr, role)
 T_PEER_HELLO_LINK  = "PEER_HELLO_LINK"
 T_PEER_DELIVER     = "PEER_DELIVER" 
 T_DB_GET_USER      = "DB_GET_USER"

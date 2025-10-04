@@ -116,17 +116,24 @@ class SOCPServer:
                     continue        # already connected
 
                 try:
+                    print(f"[peer] dialing {url} … sending JOIN as {self.server_uuid}")
                     ws = await websockets.connect(url, ping_interval=20)
                     self.url_to_ws[url] = ws
                     self.ws_to_url[ws] = url
-
-                    hello = make_env(T_PEER_HELLO_LINK, self.server_uuid, "server_*", {
-                        "host": self.listen_host,
-                        "port": int(self.listen_port),
-                        "pubkey": self.keys.pub_der_b64u(),
-                        "role": "master" if self.is_master else "local",
-                    }, self.keys)
+                    hello = make_env(
+                        T_SERVER_HELLO_JOIN,
+                        self.server_uuid,
+                        "server_*",
+                        {
+                            "host": self.listen_host,
+                            "port": int(self.listen_port),
+                            "pubkey": self.keys.pub_der_b64u(),
+                            "role": "master" if self.is_master else "local",
+                        },
+                        self.keys,
+                    )
                     await ws.send(json.dumps(hello, separators=(',',':')))
+                    print(f"[peer] => JOIN to {url}")
                     asyncio.create_task(self._peer_recv(ws))
                 except Exception:
                     pass
@@ -149,6 +156,10 @@ class SOCPServer:
 
             if t == T_PEER_HELLO_LINK:
                 await self._on_peer_hello(ws, msg)
+                if ws.closed: return
+                await self._peer_recv(ws)
+            elif t == T_SERVER_HELLO_JOIN:
+                await self._on_server_hello_join(ws, msg)
                 if ws.closed: return
                 await self._peer_recv(ws)
             elif t == T_USER_HELLO:
@@ -233,19 +244,43 @@ class SOCPServer:
 
         try:
             async for raw in ws:
-                try: msg = json.loads(raw)
-                except Exception: continue
+                try:
+                    msg = json.loads(raw)
+                    if not isinstance(msg, dict):
+                        continue
+                except Exception:
+                    continue
 
-                # IMPORTANT: process HELLOs first so dialers can register peers
-                if msg.get("type") == T_PEER_HELLO_LINK:
+                t = msg.get("type")
+                
+                # --- Handle join/welcome/announce/legacy-hello BEFORE sig verification ---
+                if t == T_PEER_HELLO_LINK:
                     await self._on_peer_hello(ws, msg)
                     continue
 
-                # Verify signature for all other peer frames
-                if not await self._verify_peer_frame(msg):
+                if t == T_SERVER_HELLO_JOIN:
+                    await self._on_server_hello_join(ws, msg)
                     continue
-                
-                # Route verified frame
+
+                if t == T_SERVER_WELCOME:
+                    await self._on_server_welcome(ws, msg)
+                    continue
+
+                if t == T_SERVER_ANNOUNCE:
+                    # Verify with the sending peer's pubkey if we already know it.
+                    known_pub = self.server_pubs.get(msg.get("from"))
+                    if known_pub and not RSAKeys.verify_payload(
+                        known_pub, msg.get("payload", {}), msg.get("sig", "")
+                    ):
+                        continue
+                    await self._on_server_announce(ws, msg)
+                    continue
+
+                # --- Everything else must pass peer signature verification ---
+                if not await self._verify_peer_frame(msg):
+                    print(f"[peer rx] {t} from={msg.get('from')} to={msg.get('to')} ts={msg.get('ts')}")
+                    continue
+
                 await self._route_peer_frame(msg)
 
         finally:
@@ -301,11 +336,23 @@ class SOCPServer:
         pl = msg.get("payload", {})
 
         if t == T_USER_ADVERTISE:
+            first_time = pl.get("user_id") not in self.user_locations
             self.user_locations[pl.get("user_id")] = pl.get("location")
+            if first_time and pl.get("location") != "local":
+                print(f"[user] connected: {pl.get('user_id')} @ {pl.get('location')}")
 
         elif t == T_USER_REMOVE:
-            if self.user_locations.get(pl.get("user_id")) == pl.get("location"):
-                self.user_locations.pop(pl.get("user_id"), None)
+            # update our view
+            uid = pl.get("user_id")
+            loc = pl.get("location")
+            if self.user_locations.get(uid) == loc:
+                self.user_locations.pop(uid, None)
+                print(f"[user] disconnected: {uid} @ {loc}")
+
+            # re-gossip to other peers (not back to source)
+            src = msg.get("from")
+            fwd = make_env(T_USER_REMOVE, self.server_uuid, "*", {"user_id": uid, "location": loc}, self.keys)
+            await self._broadcast_peers_except(src, fwd)
 
         elif t == T_PEER_DELIVER:
             await self._handle_peer_deliver(pl)
@@ -476,6 +523,142 @@ class SOCPServer:
                         T_USER_REMOVE, self.server_uuid, "*",
                         {"user_id": user_id, "location": self.server_uuid}, self.keys
                     ))
+                print(f"[user] disconnected: {user_id}")
+
+    async def _broadcast_peers_except(self, src_peer_id: Optional[str], obj: Dict[str, Any]) -> None:
+        dead = []
+        for peer_id, link in list(self.servers.items()):
+            if src_peer_id and peer_id == src_peer_id:
+                continue
+            try:
+                await self._send_raw(link.ws, obj)
+            except Exception:
+                dead.append(peer_id)
+        for pid in dead:
+            self.servers.pop(pid, None)
+    
+    async def _on_server_hello_join(self, ws, msg: dict) -> None:
+        """
+        Dialer sent T_SERVER_HELLO_JOIN to us. Cache their metadata and reply T_SERVER_WELCOME.
+        payload: {host, port, pubkey, role}
+        """
+
+        pl = msg.get("payload", {}) or {}
+        host = pl.get("host") or "?"
+        port = int(pl.get("port") or 0)
+        role = pl.get("role", "local")
+        pub  = pl.get("pubkey") or ""
+        peer_uuid = msg.get("from") or f"server_{uuid.uuid4()}"
+
+        # register/refresh
+        self.servers[peer_uuid] = Link(ws, "peer", peer_uuid)
+        self.server_addrs[peer_uuid] = (host, port)
+        if pub:
+            self.server_pubs[peer_uuid] = pub
+        self.ws_to_peeruuid[ws] = peer_uuid
+
+        print(f"[peer] <= JOIN from {peer_uuid} @{host}:{port} role={role}")
+
+        # send WELCOME with OUR metadata (signed)
+        welcome = make_env(
+            T_SERVER_WELCOME,
+            self.server_uuid,
+            peer_uuid,
+            {
+                "host": self.listen_host,
+                "port": int(self.listen_port),
+                "pubkey": self.keys.pub_der_b64u(),
+                "role": "master" if self.is_master else "local",
+            },
+            self.keys,
+        )
+        await self._send_raw(ws, welcome)
+        print(f"[peer] => WELCOME to {peer_uuid}")
+
+        # announce this newcomer to our other peers
+        announce = make_env(
+            T_SERVER_ANNOUNCE,
+            self.server_uuid,
+            "*",
+            {
+                "server_id": peer_uuid,
+                "host": host,
+                "port": port,
+                "pubkey": pub,
+                "role": pl.get("role") or "local",
+            },
+            self.keys,
+        )
+        await self._broadcast_peers_except(peer_uuid, announce)
+        print(f"[peer] join {peer_uuid} @{host}:{port}")
+
+    async def _on_server_welcome(self, ws, msg: dict) -> None:
+        """
+        We dialed THEM. They replied T_SERVER_WELCOME with their uuid+pubkey.
+        payload: {host, port, pubkey, role}
+        """
+
+        pl = msg.get("payload", {}) or {}
+        peer_uuid = msg.get("from") or f"server_{uuid.uuid4()}"
+        host = pl.get("host") or "?"
+        port = int(pl.get("port") or 0)
+        role = pl.get("role", "local")
+        pub  = pl.get("pubkey") or ""
+
+        # bind this socket to the announced uuid, store pubkey for verification
+        self.servers[peer_uuid] = Link(ws, "peer", peer_uuid)
+        self.server_addrs[peer_uuid] = (host, port)
+        if pub:
+            self.server_pubs[peer_uuid] = pub
+        self.ws_to_peeruuid[ws] = peer_uuid
+
+        print(f"[peer] <= WELCOME from {peer_uuid} @{host}:{port} role={role}")
+        
+        # tell everyone we (re)linked this peer
+        announce = make_env(
+            T_SERVER_ANNOUNCE,
+            self.server_uuid,
+            "*",
+            {
+                "server_id": peer_uuid,
+                "host": host,
+                "port": port,
+                "pubkey": pub,
+                "role": pl.get("role") or "local",
+            },
+            self.keys,
+        )
+        await self._broadcast_peers_except(peer_uuid, announce)
+        print(f"[peer] => ANNOUNCE to {peer_uuid}")
+
+    async def _on_server_announce(self, ws, msg: dict) -> None:
+        """
+        Gossip: learn/update metadata about a third server.
+        payload: {server_id, host, port, pubkey, role}
+        """
+
+        pl = msg.get("payload", {}) or {}
+        peer_uuid = msg.get("from") or "server_?"
+        sid = pl.get("server_id")
+        if not sid:
+            return
+        host = pl.get("host") or "?"
+        port = int(pl.get("port") or 0)
+        role = pl.get("role", "local")
+        pub  = pl.get("pubkey") or ""
+        self.server_addrs[sid] = (host, port)
+        if pub:
+            self.server_pubs[sid] = pub
+        
+        print(f"[peer] <= ANNOUNCE from {peer_uuid} @{host}:{port} role={role}")
+
+        # (optional) we do not auto-dial here; dialer loop can use peer_urls if desired
+        # Re-gossip further (not back to the incoming peer)
+        src = self.ws_to_peeruuid.get(ws)
+        fwd = make_env(T_SERVER_ANNOUNCE, self.server_uuid, "*", pl, self.keys)
+        await self._broadcast_peers_except(src, fwd)
+
+
 
     async def _on_user_hello(self, ws: websockets.WebSocketCommonProtocol, msg: Dict[str, Any]) -> None:
         """Registers a local user and gossips presence
@@ -663,6 +846,12 @@ class SOCPServer:
         for uid, lk in list(self.local_users.items()):
             if lk.ws is ws:
                 self.local_users.pop(uid, None)
+                if self.user_locations.get(uid) == "local":
+                    self.user_locations.pop(uid, None)
+                    # fire-and-forget announce (no await here)
+                    asyncio.create_task(self._broadcast_peers(make_env(
+                        T_USER_REMOVE, self.server_uuid, "*", {"user_id": uid, "location": self.server_uuid}, self.keys
+                    )))
 
     def _find_user_by_ws(self, ws: websockets.WebSocketCommonProtocol) -> Optional[str]:
         """Finds the local user UUID bound to a socket, if any
