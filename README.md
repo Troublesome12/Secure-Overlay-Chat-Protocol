@@ -34,11 +34,11 @@ SOCP
 ├── src                               
 │    ├── client.py              # user client
 │    ├── crypto.py              # RSA-4096 PSS/OAEP, AES-256-GCM, helpers
-│    ├── db.py                  # Master DB (JSON) + helpers
 │    ├── encoding.py            # base64url + canonical JSON
 │    ├── envelope.py            # SOCP envelope creation/signing
 │    ├── server.py              # mesh server (Master/Local)
 │    ├── protocols.py           # protocol constants
+│    ├── sdb.py                 # SQLite DB management file
 │    └── main.py                # CLI entrypoint
 ├── clean.sh                    # Command line file to clean the enviornment
 ├── README.md

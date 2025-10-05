@@ -2,8 +2,7 @@
 
 **Project:** Secure Overlay Chat Protocol (SOCP)\
 **Version:** v1.3 (protocol freeze)\
-**Repo layout:** flat `src/` (server, client); JSON Master DB; WebSocket
-transport
+**Repo layout:** flat `src/` (server, client); SQLite Master DB; WebSocket transport
 
 ---
 

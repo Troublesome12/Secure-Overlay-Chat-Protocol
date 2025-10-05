@@ -12,11 +12,10 @@ from typing import Dict, Optional, Tuple, Any
 
 from websockets.server import WebSocketServerProtocol
 
+from sdb import SOCPStore
 from protocols import *
 from crypto import RSAKeys
 from envelope import make_env
-from db import MasterDB
-        
 
 
 
@@ -70,7 +69,6 @@ class SOCPServer:
         self.listen_host, self.listen_port = listen.split(":")
         self.keys = RSAKeys.load_or_create(key_path)
         self.peer_urls = set(peer_urls)
-        self.db = MasterDB(db_path or pathlib.Path("data/master_db.json")) if self.is_master else None
         self.servers: Dict[str, Link] = {}
         self.server_addrs: Dict[str, Tuple[str, int]] = {}
         self.server_pubs: Dict[str, str] = {}
@@ -88,6 +86,10 @@ class SOCPServer:
         self.url_to_ws = {}
         self.ws_to_url = {}
 
+        self.store = SOCPStore(pathlib.Path("data/socp.db"))
+        self.db = self.store if self.is_master else None
+        if self.is_master and self.db:
+            self.db.ensure_public_group()
 
     async def run(self) -> None:
         """Starts the WebSocket server and the dialer loop
@@ -346,6 +348,9 @@ class SOCPServer:
             was = self.user_locations.get(uid)
             self.user_locations[uid] = sid
 
+            if self.is_master and self.db:
+                self.db.add_member_public(uid)
+
             if was is None or was != sid:
                 print(f"[user] connected: {uid} @ {sid}")
 
@@ -354,6 +359,8 @@ class SOCPServer:
             sid = pl.get("server_id")
             if uid and sid and self.user_locations.get(uid) == sid:
                 self.user_locations.pop(uid, None)
+                if self.is_master and self.db:
+                    self.db.remove_member_public(uid)
                 print(f"[user] disconnected: {uid} @ {sid}")
             src = msg.get("from")
             fwd = make_env(T_USER_REMOVE, self.server_uuid, "*",
@@ -446,9 +453,8 @@ class SOCPServer:
         pl = msg.get("payload", {}) or {}
         uid = pl.get("user_id")
         pub = pl.get("pubkey")
-        if uid and pub:
-            self.db.register_user(uid, pub)
-            # optional: print(f"[db] registered {uid}")
+        if self.is_master and self.db and uid and pub:
+            self.db.upsert_user(uid, pub)
 
     async def _on_user_list_req(self, ws, msg) -> None:
         """Builds a sorted list of known-online users and replies to the requester.
@@ -600,6 +606,9 @@ class SOCPServer:
                     )
                     await self._broadcast_peers(removal)
 
+                if self.is_master and self.db:
+                    self.db.remove_member_public(user_id)
+                
                 print(f"[user] disconnected: {user_id}")
 
     async def _broadcast_peers_except(self, src_peer_id: Optional[str], obj: Dict[str, Any]) -> None:
@@ -764,6 +773,11 @@ class SOCPServer:
             await self._send_to_master(make_env(T_DB_REGISTER, self.server_uuid, self.master_uuid, {
                 "user_id": user_id, "pubkey": pub
             }, self.keys))
+        
+        if self.is_master and self.db:
+            self.db.upsert_user(user_id, pub)
+            self.store.add_member_public(user_id)
+        
         await self._broadcast_peers(make_env(T_USER_ADVERTISE, self.server_uuid, "*", {
             "user_id": user_id, "server_id": self.server_uuid
         }, self.keys))
@@ -994,6 +1008,9 @@ class SOCPServer:
                     asyncio.create_task(self._broadcast_peers(make_env(
                         T_USER_REMOVE, self.server_uuid, "*", {"user_id": uid, "server_id": self.server_uuid}, self.keys
                     )))
+                
+                if self.is_master and self.db:
+                    self.db.remove_member_public(uid)
 
     def _find_user_by_ws(self, ws: websockets.WebSocketCommonProtocol) -> Optional[str]:
         """Finds the local user UUID bound to a socket, if any
