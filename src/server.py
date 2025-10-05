@@ -83,6 +83,8 @@ class SOCPServer:
         self.seen_pub_files_chunk: set[tuple[str,int]] = set()  # (file_id, index)
         self.seen_pub_files_end: set[str] = set()
         self.seen_ids: dict[str,int] = {}
+        self.public_members: set[str] = set()
+        self.public_version: int = 1
         self.url_to_ws = {}
         self.ws_to_url = {}
 
@@ -336,22 +338,26 @@ class SOCPServer:
         pl = msg.get("payload", {})
 
         if t == T_USER_ADVERTISE:
-            first_time = pl.get("user_id") not in self.user_locations
-            self.user_locations[pl.get("user_id")] = pl.get("location")
-            if first_time and pl.get("location") != "local":
-                print(f"[user] connected: {pl.get('user_id')} @ {pl.get('location')}")
+            uid = pl.get("user_id")
+            sid = pl.get("server_id")
+            if not uid or not sid:
+                return
+
+            was = self.user_locations.get(uid)
+            self.user_locations[uid] = sid
+
+            if was is None or was != sid:
+                print(f"[user] connected: {uid} @ {sid}")
 
         elif t == T_USER_REMOVE:
-            # update our view
             uid = pl.get("user_id")
-            loc = pl.get("location")
-            if self.user_locations.get(uid) == loc:
+            sid = pl.get("server_id")
+            if uid and sid and self.user_locations.get(uid) == sid:
                 self.user_locations.pop(uid, None)
-                print(f"[user] disconnected: {uid} @ {loc}")
-
-            # re-gossip to other peers (not back to source)
+                print(f"[user] disconnected: {uid} @ {sid}")
             src = msg.get("from")
-            fwd = make_env(T_USER_REMOVE, self.server_uuid, "*", {"user_id": uid, "location": loc}, self.keys)
+            fwd = make_env(T_USER_REMOVE, self.server_uuid, "*",
+                        {"user_id": uid, "server_id": sid}, self.keys)
             await self._broadcast_peers_except(src, fwd)
 
         elif t == T_PEER_DELIVER:
@@ -361,19 +367,22 @@ class SOCPServer:
             pl = msg.get("payload", {}) or {}
             user = pl.get("user_id")
             loc = self.user_locations.get(user)
+            sender_ts = msg.get("ts")
+
             if loc == "local":
-                await self._deliver_to_local_user(user, {
+                payload = {
                     "ciphertext": pl.get("ciphertext"),
                     "sender": pl.get("sender"),
                     "sender_pub": pl.get("sender_pub"),
                     "content_sig": pl.get("content_sig",""),
-                    "content_ts": pl.get("content_ts"),
-                })
+                }
+                env = make_env(T_USER_DELIVER, self.server_uuid, user, payload, self.keys)
+                env["ts"] = sender_ts
+                await self._send_raw(self.local_users[user].ws, env)
+
             elif isinstance(loc, str) and loc.startswith(("server_", "master_server_")):
-                lk = self.servers.get(loc)
-                if lk:
-                    # forward unchanged
-                    await self._send_raw(lk.ws, msg)
+                fwd = dict(msg)                            # keep whole envelope intact
+                await self._send_raw(self.servers[loc].ws, fwd)
 
         elif t == T_DB_GET_USER and self.is_master:
             await self._handle_db_get_user(msg)
@@ -393,7 +402,8 @@ class SOCPServer:
                 await self._send_raw(user_ws, resp)
 
         elif t in (T_PUBLIC_CHANNEL_ADD, T_PUBLIC_CHANNEL_UPDATED, T_PUBLIC_CHANNEL_KEY_SHARE):
-            await self._broadcast_peers(msg)
+            await self._broadcast_peers_except(msg.get("from"), msg)
+            return
 
         elif t == T_MSG_PUBLIC_CHANNEL:
             await self._on_public_from_peer(msg)
@@ -492,10 +502,21 @@ class SOCPServer:
             await self._send_raw(peer.ws, resp)
 
     async def _user_recv(self, ws: websockets.WebSocketCommonProtocol) -> None:
-        """Receives frames from a connected user and dispatches
+        """Receives and processes frames from a connected user socket.
 
-        Args:
-            ws (websockets.WebSocketCommonProtocol): User socket
+        Dispatches all user-originated frames to their appropriate handlers:
+        - MSG_DIRECT: end-to-end encrypted direct message (RSA-OAEP)
+        - MSG_PUBLIC_CHANNEL: broadcast to public channel
+        - PUBLIC_CHANNEL_*: rebroadcast membership/key updates
+        - FILE_*: file transfer (direct or public)
+        - USER_LIST_REQ: list online users
+        - USER_DB_GET: lookup another user's pubkey
+        - HEARTBEAT: ignore (keepalive)
+        - DUMP_USERS: diagnostic list of local users
+
+        On disconnect:
+        - Removes user from local registry
+        - Broadcasts USER_REMOVE to all peers
         """
 
         try:
@@ -506,16 +527,31 @@ class SOCPServer:
                     continue
 
                 t = msg.get("type")
+                if not t:
+                    continue
+
+                # --- Direct Messages (Private DM) ---
                 if t == T_MSG_DIRECT:
                     await self._on_msg_direct(ws, msg)
+
+                # --- Public Channel Management ---
                 elif t in (T_PUBLIC_CHANNEL_ADD, T_PUBLIC_CHANNEL_UPDATED, T_PUBLIC_CHANNEL_KEY_SHARE):
+                    # Forward these to all peers (no local processing)
                     await self._broadcast_peers(make_env(t, self.server_uuid, "*", msg.get("payload", {}), self.keys))
-                elif t  == T_MSG_PUBLIC_CHANNEL:
+
+                # --- Public Channel Chat Messages ---
+                elif t == T_MSG_PUBLIC_CHANNEL:
                     await self._on_public_from_user(ws, msg)
+
+                # --- User List Request (/list) ---
                 elif t == T_USER_LIST_REQ:
                     await self._on_user_list_req(ws, msg)
+
+                # --- Database Lookup Request (/dbget <user>) ---
                 elif t == T_USER_DB_GET:
                     await self._on_user_db_get(ws, msg)
+
+                # --- File Transfers ---
                 elif t in (T_FILE_START, T_FILE_CHUNK, T_FILE_END):
                     pl = msg.get("payload", {}) or {}
                     to = msg.get("to", "")
@@ -524,28 +560,46 @@ class SOCPServer:
                         await self._on_file_public_from_user(msg)
                     else:
                         await self._on_file_from_user(ws, msg)
-                
+
+                # --- Debug: Dump all local users (/dump) ---
                 elif t == T_DUMP_USERS:
-                    await self._send_raw(ws, make_env(
+                    resp = make_env(
                         T_DUMP_USERS,
                         self.server_uuid,
                         msg.get("from") or "user_*",
                         {"users": list(self.local_users.keys())},
                         self.keys,
-                    ))
-        
+                    )
+                    await self._send_raw(ws, resp)
+
+                # --- Heartbeat (ignored) ---
                 elif t == ("HEARTBEAT" if "T_HEARTBEAT" not in globals() else T_HEARTBEAT):
                     continue
+
+                else:
+                    # Unknown or unsupported message type
+                    await self._send_error(ws, E_UNKNOWN_TYPE, f"unrecognized type: {t}")
+
         finally:
+            # --- Handle user disconnection ---
             user_id = self._find_user_by_ws(ws)
             if user_id:
                 self.local_users.pop(user_id, None)
+
+                # Remove from presence map only if still mapped locally
                 if self.user_locations.get(user_id) == "local":
                     self.user_locations.pop(user_id, None)
-                    await self._broadcast_peers(make_env(
-                        T_USER_REMOVE, self.server_uuid, "*",
-                        {"user_id": user_id, "location": self.server_uuid}, self.keys
-                    ))
+
+                    # Broadcast USER_REMOVE (v1.3 uses server_id field)
+                    removal = make_env(
+                        T_USER_REMOVE,
+                        self.server_uuid,
+                        "*",
+                        {"user_id": user_id, "server_id": self.server_uuid},
+                        self.keys,
+                    )
+                    await self._broadcast_peers(removal)
+
                 print(f"[user] disconnected: {user_id}")
 
     async def _broadcast_peers_except(self, src_peer_id: Optional[str], obj: Dict[str, Any]) -> None:
@@ -614,6 +668,8 @@ class SOCPServer:
         )
         await self._broadcast_peers_except(peer_uuid, announce)
         print(f"[peer] join {peer_uuid} @{host}:{port}")
+        await self._send_presence_snapshot(peer_uuid)
+        await self._send_public_snapshot(peer_uuid)
 
     async def _on_server_welcome(self, ws, msg: dict) -> None:
         """
@@ -653,6 +709,8 @@ class SOCPServer:
         )
         await self._broadcast_peers_except(peer_uuid, announce)
         print(f"[peer] => ANNOUNCE to {peer_uuid}")
+        await self._send_presence_snapshot(peer_uuid)
+        await self._send_public_snapshot(peer_uuid)
 
     async def _on_server_announce(self, ws, msg: dict) -> None:
         """
@@ -707,9 +765,51 @@ class SOCPServer:
                 "user_id": user_id, "pubkey": pub
             }, self.keys))
         await self._broadcast_peers(make_env(T_USER_ADVERTISE, self.server_uuid, "*", {
-            "user_id": user_id, "location": self.server_uuid
+            "user_id": user_id, "server_id": self.server_uuid
         }, self.keys))
         print(f"[user] connected: {user_id}")
+        
+        if user_id not in self.public_members:
+            self.public_members.add(user_id)
+            self.public_version += 1
+            add_env = make_env(
+                T_PUBLIC_CHANNEL_ADD,
+                self.server_uuid,
+                "*",
+                {"add": [user_id], "if_version": 1},  # minimal, per §9.3
+                self.keys,
+            )
+            await self._broadcast_peers(add_env)
+
+            # optional: also send an UPDATED snapshot right away
+            upd_env = make_env(
+                T_PUBLIC_CHANNEL_UPDATED,
+                self.server_uuid,
+                "*",
+                {
+                    "version": self.public_version,
+                    "wraps": [],  # we’re not distributing a secret; empty list is fine for your plaintext approach
+                },
+                self.keys,
+            )
+            await self._broadcast_peers(upd_env)
+
+    async def _send_public_snapshot(self, peer_id: str) -> None:
+        """Send current public-channel membership to a single peer."""
+        link = self.servers.get(peer_id)
+        if not link:
+            return
+        env = make_env(
+            T_PUBLIC_CHANNEL_UPDATED,
+            self.server_uuid,
+            peer_id,
+            {
+                "version": self.public_version,
+                "wraps": [],  # no per-member key wraps in your implementation
+            },
+            self.keys,
+        )
+        await self._send_raw(link.ws, env)
 
     async def _on_msg_direct(self, ws, msg: Dict[str, Any]) -> None:
         """Routes a MSG_DIRECT to either a local user (USER_DELIVER) or next hop (SERVER_DELIVER)
@@ -719,17 +819,24 @@ class SOCPServer:
             msg (Dict[str, Any]): MSG_PRIVATE frame
         """
 
-        frm = msg.get("from"); to = msg.get("to"); pl = msg.get("payload", {}) or {}
+        frm = msg.get("from"); 
+        to = msg.get("to"); 
+        pl = msg.get("payload", {}) or {}
+        original_ts = msg.get("ts")
         loc = self.user_locations.get(to)
 
         if loc == "local":
-            await self._deliver_to_local_user(to, {
+            # Build payload unchanged
+            deliver_pl = {
                 "ciphertext": pl.get("ciphertext"),
                 "sender": frm,
                 "sender_pub": pl.get("sender_pub"),
                 "content_sig": pl.get("content_sig",""),
-                "content_ts": msg.get("ts"),
-            })
+            }
+            # Create env and then overwrite ts to the original
+            env = make_env(T_USER_DELIVER, self.server_uuid, to, deliver_pl, self.keys)
+            env["ts"] = original_ts                         # <- preserve sender ts
+            await self._send_raw(self.local_users[to].ws, env)
             return
 
         if isinstance(loc, str) and loc.startswith(("server_", "master_server_")):
@@ -743,8 +850,8 @@ class SOCPServer:
                 "sender": frm,
                 "sender_pub": pl.get("sender_pub"),
                 "content_sig": pl.get("content_sig",""),
-                "content_ts": msg.get("ts"),
             }, self.keys)
+            hop["ts"] = original_ts
             await self._send_raw(lk.ws, hop)
             return
 
@@ -798,6 +905,25 @@ class SOCPServer:
             await self._send_to_master(make_env(T_DB_GET_USER, self.server_uuid, self.master_uuid, {
                 "user_id": target, "req_id": req_id
             }, self.keys))
+
+    async def _send_presence_snapshot(self, peer_id: str) -> None:
+        """Tell a freshly linked peer about all users currently local here."""
+        link = self.servers.get(peer_id)
+        if not link:
+            return
+        # build and send one advertise per local user
+        for uid in list(self.local_users.keys()):
+            adv = make_env(
+                T_USER_ADVERTISE,
+                self.server_uuid,
+                peer_id,
+                {"user_id": uid, "server_id": self.server_uuid},  # v1.3 uses server_id
+                self.keys,
+            )
+            try:
+                await self._send_raw(link.ws, adv)
+            except Exception:
+                pass
 
     async def _deliver_to_local_user(self, user_id: str, payload: Dict[str, Any]) -> None:
         """Sends USER_DELIVER to a connected local user
@@ -866,7 +992,7 @@ class SOCPServer:
                     self.user_locations.pop(uid, None)
                     # fire-and-forget announce (no await here)
                     asyncio.create_task(self._broadcast_peers(make_env(
-                        T_USER_REMOVE, self.server_uuid, "*", {"user_id": uid, "location": self.server_uuid}, self.keys
+                        T_USER_REMOVE, self.server_uuid, "*", {"user_id": uid, "server_id": self.server_uuid}, self.keys
                     )))
 
     def _find_user_by_ws(self, ws: websockets.WebSocketCommonProtocol) -> Optional[str]:

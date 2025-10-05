@@ -14,8 +14,6 @@ from pathlib import Path
 from protocols import *
 from crypto import  RSAKeys, rsa_encrypt, rsa_decrypt, rsa_chunk_iter
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding as asy_padding
 from encoding import b64u_encode, b64u_decode
 
 
@@ -48,6 +46,7 @@ class SOCPClient:
         self.recv_files: dict[str, dict] = {}       # file_id -> {"fh": f, "path": Path, "mode": str, "group_id": str|None}
         self.ws: websockets.WebSocketClientProtocol | None = None
         self._send_lock = asyncio.Lock()
+        self.public_members: set[str] = set()
 
     async def run(self) -> None:
         """Connects to the server, sends USER_HELLO, and runs receiver + REPL"""
@@ -100,7 +99,7 @@ class SOCPClient:
                         "ciphertext": pl.get("ciphertext"),
                         "from": sender,
                         "to":   self.user_uuid,
-                        "ts":   pl.get("content_ts", msg.get("ts")),
+                        "ts":   msg.get("ts"),
                     }
                     verified = RSAKeys.verify_payload(sender_pub, content_obj, pl.get("content_sig",""))
                 except Exception:
@@ -125,24 +124,39 @@ class SOCPClient:
 
             elif t == T_USER_LIST:
                 users = pl.get("users") or []
+                self.public_members = set(u for u in users if u != self.user_uuid)
                 print("[online]")
                 for u in users:
                     print(f" - {u}")
 
+            elif t == T_PUBLIC_CHANNEL_KEY_SHARE:
+                share = pl
+                wrapped = share.get("wrapped_public_channel_key","")
+                try:
+                    self.pubchan_key = rsa_decrypt(self.keys.priv, wrapped)  # bytes (AES key)
+                    print("[public] channel key received")
+                except Exception as e:
+                    print(f"[public] key unwrap failed: {e}")
+
             elif t == T_MSG_PUBLIC_CHANNEL:
                 p = pl
+                # don’t echo our own public post
+                if p.get("from") == self.user_uuid:
+                    continue
+
                 content_obj = {
                     "channel": p.get("channel"),
                     "text": p.get("text"),
                     "from": p.get("from"),
                     "ts": p.get("ts"),
                 }
-                ok = RSAKeys.verify_payload(p.get("sender_pub",""), content_obj, p.get("content_sig",""))
-                if p.get("from") == self.user_uuid:
-                    continue
+                ok = RSAKeys.verify_payload(
+                    p.get("sender_pub", ""),
+                    content_obj,
+                    p.get("content_sig", "")
+                )
                 badge = "🔐" if ok else "⚠️"
-                # If your public messages are plaintext, change printed field accordingly
-                print(f"[Public Channel] {badge} {p.get('from')}: {p.get('text') or '<encrypted>'}")
+                print(f"[Public Channel] {badge} {p.get('from')}: {p.get('text')}")
                 
             elif t == T_FILE_START:
                 await self._handle_file_start(pl)      # sets up recv_files[file_id]
@@ -334,7 +348,6 @@ class SOCPClient:
                 "ciphertext": ciphertext,
                 "sender_pub": self.keys.pub_der_b64u(),
                 "content_sig": content_sig,
-                "content_ts": ts,
             },
             "sig": "",
         }
@@ -349,11 +362,8 @@ class SOCPClient:
         """
 
         assert self.ws
-        # Per your spec style: we still use end-to-end content signature; server does not decrypt.
-        # For simplicity and to keep payload small, we send plaintext with PSS content_sig;
-        # confidentiality on a public channel is not required; integrity/authenticity is.
-
         ts = int(time.time() * 1000)
+
         content_obj = {
             "channel": "public",
             "text": text,
@@ -372,7 +382,7 @@ class SOCPClient:
             "to": "server_*",
             "ts": ts,
             "payload": payload,
-            "sig": "",     # transport sig not required on user->server link (TLS-equivalent); your server signs on peer hops
+            "sig": "",
         }
         await self.ws.send(json.dumps(env, separators=(",", ":")))
         print(f"[you ->  Public Channel] {text}")
