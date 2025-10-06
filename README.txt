@@ -8,13 +8,18 @@ Type: Secure Distributed Chat System using WebSockets
 ---------------------------------------------------------
 Overview
 ---------------------------------------------------------
-The Secure Overlay Chat Protocol (SOCP) is a distributed chat application that allows
-multiple servers and users to communicate securely across a peer-to-peer mesh.
-It focuses on privacy, authentication, and message integrity using strong encryption.
+The Secure Overlay Chat Protocol (SOCP) is a distributed, RSA-secured chat framework 
+designed for confidential and authenticated communication across a peer-to-peer mesh 
+of servers and users.
 
-The system uses RSA-4096 for encryption and signing, ensuring that every direct message,
-file transfer, and public announcement is verifiable and tamper-proof. Each user connects
-to a local server, and all servers in the mesh synchronize through the Master server.
+Each user connects to a local SOCP server, and all servers form a federated overlay 
+where the Master server acts as the authoritative registry for user identities and 
+public keys. 
+
+All data exchanged — including messages, announcements, and file transfers — is 
+protected through pure RSA-4096 cryptography (OAEP for encryption and PSS for signing), 
+ensuring authenticity and integrity across the network without using any symmetric 
+key wrapping.
 
 !!! VULNERABILITY INJECTED — FOR STUDY PURPOSE !!!
 
@@ -39,35 +44,43 @@ PoC:
 Core Components
 ---------------------------------------------------------
 1. **Master Server**
-   - Acts as a central authority.
-   - Registers users and stores their public keys.
-   - Communicates with all local servers in the mesh.
+   - Acts as the root authority for the mesh.
+   - Maintains the SQLite database (`data/socp.db`) storing registered users and 
+     public keys.
+   - Responds to DB lookup and registration requests from local servers.
 
 2. **Local Server**
-   - Handles local user connections.
-   - Relays messages and files between users and peers.
-   - Keeps track of online users and their locations.
+   - Hosts user connections locally via WebSocket.
+   - Forwards encrypted messages and files to other servers based on routing tables.
+   - Broadcasts user presence and public messages across the network.
+   - Stores cached metadata and relays Master DB requests when needed.
 
 3. **Client**
-   - User application for messaging and file sharing.
-   - Supports both encrypted direct messages and public broadcasts.
+   - User-facing application for encrypted chat and file sharing.
+   - Supports:
+       - `/tell <user> <text>` → RSA-encrypted DM (end-to-end secure)
+       - `/all <text>` → signed public broadcast
+       - `/file <user|public> <path>` → per-chunk RSA file transfer
+   - Each client holds an RSA-4096 keypair generated on first use.
 
 4. **Encryption System**
-   - Uses RSA-4096 OAEP (SHA-256) for encryption.
-   - Uses RSA-PSS (SHA-256) for digital signatures.
-   - AES-256-GCM is optionally used for file encryption.
-   - Encodes binary data using Base64 URL format (no padding).
+   - **Encryption:** RSA-4096 OAEP (SHA-256) for all private messages and file chunks.
+   - **Signing:** RSA-PSS (SHA-256) for message and file authenticity.
+   - **Hashing:** SHA-256 for integrity checks and manifest verification.
+   - **Encoding:** Base64URL (no padding) for all binary data.
+   - **No AES hybrid:** all operations are handled via RSA only.
 
 ---------------------------------------------------------
 Features
 ---------------------------------------------------------
-- End-to-end encryption for private messages.
-- Public message broadcasting to all users.
-- Secure file sharing (encrypted for DM, signed for public).
-- Peer-to-peer server linking (multi-server mesh).
-- Automatic presence update (join/leave notifications).
-- Signature verification for message authenticity.
-- Minimal dependencies and easy setup.
+- End-to-end encrypted Direct Messages using RSA-4096.
+- Public Channel broadcasts signed with RSA-PSS (plaintext, authenticated only).
+- File sharing with RSA-based encryption for DMs and signed plaintext for public.
+- Peer-to-peer server linking (multi-server mesh replication).
+- Real-time user presence (join and leave announcements).
+- Automatic public channel membership upon connection.
+- Persistent SQLite database for user, key, and group management.
+- Clean separation between Master and Local server logic.
 
 ---------------------------------------------------------
 Setup and Installation
@@ -118,13 +131,16 @@ Example Usage
    /file public ./requirements.txt
 
 ---------------------------------------------------------
-Security Overview
+Artifacts and Persistence
 ---------------------------------------------------------
-The system ensures:
-- Confidentiality: Only the intended recipient can read messages.
-- Integrity: Each message and file is signed to prevent tampering.
-- Authentication: Every user and server has a unique RSA-4096 key.
-- Non-repudiation: Senders cannot deny sending a signed message.
+All runtime data, keys, and received files are stored locally to allow 
+persistent identities and message continuity across sessions.
+
+Artifacts are saved under:
+
+- `downloads/` — received files and attachments from peers
+- `data/socp.db` — main SQLite database for users, public channel, and membership
+- `keys/` — RSA-4096 PEM files and UUID identities for both Master and Local servers
 
 ---------------------------------------------------------
 Reset and Cleanup
@@ -141,13 +157,26 @@ If you want to reset your environment:
    $ ./clean.sh --nuke-master
 
 ---------------------------------------------------------
+Security Overview
+---------------------------------------------------------
+The SOCP framework enforces:
+- **Confidentiality:** Only the intended recipient can decrypt messages.
+- **Integrity:** All payloads (messages, files, channel posts) are signed and verified.
+- **Authentication:** Every entity (server or user) owns a persistent RSA-4096 keypair.
+- **Non-repudiation:** Senders cannot deny signed communications.
+- **No shared symmetric keys:** Every encryption and signature is performed using RSA-4096.
+
+---------------------------------------------------------
 Protocol Compliance (v1.3)
 ---------------------------------------------------------
-- Encryption: RSA-4096 OAEP (SHA-256)
-- Signature: RSA-PSS (SHA-256)
-- Encoding: Base64 URL without padding
-- Transport: WebSocket JSON frames
-- Structure: {type, from, to, ts, payload, sig}
+- **Envelope Structure:** {type, from, to, ts, payload, sig}
+- **Encryption:** RSA-4096 OAEP (SHA-256)
+- **Signature:** RSA-PSS (SHA-256)
+- **Hashing:** SHA-256
+- **Encoding:** Base64URL (no padding)
+- **Transport:** WebSocket (UTF-8 JSON text frames)
+- **Persistence:** SQLite (`data/socp.db`) for user and channel records
+- **Identity Management:** `--role master` designates the permanent Master UUID
 
 ---------------------------------------------------------
 End of File

@@ -19,10 +19,10 @@
 - **Phone:** 0478614602
 
 ## Features
-- **Server (mesh peer)**: Handles peer linking (`PEER_HELLO_LINK`), user presence gossip (`USER_ADVERTISE` / `USER_REMOVE`), and DM routing (`PEER_DELIVER` / `USER_DELIVER`).
-- **Master DB**: Single authority (configurable by `--master-uuid`) for user registry & pubkey lookup. Locals proxy DB-RPC requests to the Master.
-- **Client**: Users attach to one local server; DMs are **RSA-encrypted** (OAEP-SHA256) and **content‑signed** (RSA-PSS-SHA256).
-- **Security**: Pure RSA-4096 cryptography — no AES keywrap — using SHA-256, base64url (no padding), and canonical JSON signing.
+- **Server (mesh peer):** Peer linking (`SERVER_HELLO_JOIN` → `SERVER_WELCOME` → `SERVER_ANNOUNCE`), user presence gossip (`USER_ADVERTISE` / `USER_REMOVE`), and routing (`MSG_DIRECT`, `SERVER_DELIVER`, `USER_DELIVER`, `MSG_PUBLIC_CHANNEL`).
+- **Master Database:** A central SQLite database (`data/socp.db`) to store user information, public channel membership, and RSA public keys.
+- **Client:** Connects to one local server. Direct messages (DMs) are **RSA‑OAEP(SHA‑256)** encrypted and **RSA‑PSS(SHA‑256)** signed. Public messages are plaintext but signed for authenticity.
+- **Security:** 100% **RSA‑4096** (no AES). Uses SHA‑256, base64url encoding, and canonical JSON for all signatures.
 
 <br>
 
@@ -46,26 +46,16 @@ SOCP
 └── requirements.txt
 ```
 
-## Install
+## Setup
 ```bash
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Quickstart
-- **Master**: stable UUID stored in `keys/master.uuid` (generated once if missing).
-- **Local server**: per-node UUID stored in `keys/server.uuid` (generated if missing).
+## Running the System
 
-### Generate UUIDs explicitly (optional)
-```bash
-# Generate and persist a Master server UUID (writes in keys/master.uuid)
-python3 src/main.py gen master
+### Start the Servers
 
-# Generate and persist a Local server UUID (writes in keys/server.uuid)
-python3 src/main.py gen local
-```
-
-### Run servers
 ```bash
 # Master server (uses keys/master.uuid; creates if missing)
 python3 src/main.py server --role master --listen 0.0.0.0:9101
@@ -77,25 +67,25 @@ python3 src/main.py server --role local --listen 127.0.0.1:9102 --master-url ws:
 # If your master runs on another host, use --listen 0.0.0.0:9101 on the master and --master-url ws://<MASTER_IP>:9101 on locals.
 ```
 
-### Run clients
+### Start clients
 ```bash
-# Client Alice
+# Client Alice (connects to master)
 python3 src/main.py client --user-uuid Alice --server ws://127.0.0.1:9101
 
-# Client Bob
+# Client Bob (connects to local server)
 python3 src/main.py client --user-uuid Bob --server ws://127.0.0.1:9102
 ```
 
 ### Client commands
 ```
-/help                                               # list all commands
-/list                                               # show all online users
-/pubget                                             # print your own public key
-/dbget <user_uuid>                                  # fetch and cache a user's public key
-/tell <user_uuid> <text>                            # send RSA-OAEP encrypted + RSA-PSS signed DM
-/all <text>                                         # post public message (signed only)
-/file <user_uuid|public> <file_path>                # send file (RSA-OAEP per recipient; plaintext for public)
-/quit                                               # close the client
+/help                                 # Show command list
+/list                                 # Show online users
+/pubget                               # Display your public key
+/dbget <user_uuid>                    # Fetch another user's public key from master
+/tell <user_uuid> <text>              # Send RSA-encrypted, PSS-signed DM
+/all <text>                           # Broadcast a message to all users
+/file <user_uuid|public> <path>       # Send file (RSA per-chunk for DM, plaintext for public)
+/quit                                 # Exit the client
 ```
 
 ### Message Flow
@@ -132,15 +122,16 @@ python3 src/main.py client --user-uuid Bob --server ws://127.0.0.1:9102
 /file public ./requirements.txt              # send file to all the online users
 ```
 
-## Cleanup / Reset
+## Cleanup Script
 
-Use the helper script to reset local state between runs.
+To reset all runtime data and kill open ports:
 
 ```bash
 chmod +x clean.sh           # Make the script executable (one-time)
 ./clean.sh                  # reset local runtime (preserves master identity)
 ./clean.sh --nuke-master    # Full reset  (deletes master identity too)
 ```
+This removes DBs, cached keys, downloads, and running ports (9101–9103).
 
 ## SOCP Compliance (v1.3)
 
@@ -152,38 +143,41 @@ chmod +x clean.sh           # Make the script executable (one-time)
     </tr>
   </thead>
   <tbody>
-  <tr>
-      <td style="text-align:left;">Envelope</td>
-      <td style="text-align:left;"><code>{type, from, to, ts(ms), payload, sig}</code></td>
-    </tr>
     <tr>
+      <td style="text-align:left;">Envelope</td>
+      <td style="text-align:left;"><code>{type, from, to, ts(ms), payload, sig}</code> — Canonical JSON, signed and verifiable</td>
+    </tr>
+    <tr> 
       <td style="text-align:left;">Signature</td>
-      <td style="text-align:left;">RSA-PSS(SHA-256) over canonical <code>payload</code></td>
+      <td style="text-align:left;">RSA-PSS (SHA-256) over canonical <code>payload</code></td>
     </tr>
     <tr>
       <td style="text-align:left;">Encryption (DMs)</td>
-      <td style="text-align:left;">RSA-4096 OAEP(SHA-256) — no AES hybrid</td>
+      <td style="text-align:left;">Pure RSA-4096 OAEP (SHA-256); servers never decrypt user ciphertexts</td>
+    </tr> 
+    <tr> 
+      <td style="text-align:left;">Encryption (Public Channel)</td>
+      <td style="text-align:left;">Plaintext with RSA-PSS authenticity signature; no confidentiality enforced</td>
     </tr>
     <tr>
       <td style="text-align:left;">Hashing</td>
-      <td style="text-align:left;">SHA-256</td>
+      <td style="text-align:left;">SHA-256 for message integrity, manifest signing, and file hashing</td>
     </tr>
     <tr>
       <td style="text-align:left;">Encoding</td>
-      <td style="text-align:left;">base64url (no padding) for all binary fields</td>
+      <td style="text-align:left;">Base64URL (no padding) for all binary data (keys, ciphertext, signatures)</td>
     </tr>
     <tr>
       <td style="text-align:left;">Transport</td>
-      <td style="text-align:left;">WebSocket (JSON text frames)</td>
+      <td style="text-align:left;">WebSocket (JSON text frames; one envelope per frame)</td>
+    </tr>
+    <tr>
+      <td style="text-align:left;">Persistence</td>
+      <td style="text-align:left;">SQLite (<code>data/socp.db</code>) — stores users, keys, and public channel membership</td>
     </tr>
     <tr>
       <td style="text-align:left;">Identity</td>
-      <td style="text-align:left;"><code>--role</code> master designates permanent Master (UUID persisted)</td>
+      <td style="text-align:left;"><code>--role master</code> designates the permanent Master server (UUID + PEM persisted under <code>keys/</code>)</td>
     </tr>
   </tbody>
-</table><br>
-
-
-## Version Notes
-- v1.0 – v1.2: AES-GCM hybrid encryption (deprecated).
-- v1.3: Fully RSA-based — simplified key management, stronger signature discipline, and reduced dependencies.
+</table>

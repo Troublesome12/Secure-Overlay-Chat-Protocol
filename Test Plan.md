@@ -42,10 +42,10 @@ Common client commands (for tests):
 /file <user_uuid|public> <file_path>
 /quit
 ```
-Artifacts saved under: 
-- `downloads/` (received files) 
-- `data/master_db.json` (directory) 
-- `keys/` (generated keys)
+Artifacts are saved under:
+- `downloads/` — received files and attachments from peers
+- `data/socp.db` — main SQLite database for users, public channel, and membership
+- `keys/` — RSA-4096 PEM files and UUID identities for both Master and Local servers
 
 
 ## Test
