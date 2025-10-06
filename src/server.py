@@ -761,21 +761,26 @@ class SOCPServer:
             Exception: If sending errors or gossip fails
         """
 
-        user_id = msg.get("from"); pl = msg.get("payload", {})
+        user_id = msg.get("from"); 
+        pl = msg.get("payload", {})
+        
         if user_id in self.local_users:
-            await self._send_error(ws, E_NAME_IN_USE, f"{user_id} already connected"); await ws.close(); return
+            await self._send_error(ws, E_NAME_IN_USE, f"{user_id} already connected"); 
+            await ws.close(); 
+            return
+        
         self.local_users[user_id] = Link(ws, 'user', user_id)
         self.user_locations[user_id] = "local"
+
         pub = pl.get("pubkey", "")
-        if self.is_master and self.db:
-            self.db.register_user(user_id, pub)
-        else:
+
+        if not self.is_master:
             await self._send_to_master(make_env(T_DB_REGISTER, self.server_uuid, self.master_uuid, {
                 "user_id": user_id, "pubkey": pub
             }, self.keys))
-        
+
         if self.is_master and self.db:
-            self.db.upsert_user(user_id, pub)
+            self.store.upsert_user(user_id, pub)
             self.store.add_member_public(user_id)
         
         await self._broadcast_peers(make_env(T_USER_ADVERTISE, self.server_uuid, "*", {
