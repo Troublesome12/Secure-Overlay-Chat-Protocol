@@ -48,7 +48,9 @@ SOCP
 
 ## Setup
 ```bash
-python3 -m venv venv && source venv/bin/activate
+brew install python@3.9
+python -m venv venv && source venv/bin/activate
+pip install -U pip setuptools wheel
 pip install -r requirements.txt
 ```
 

@@ -10,6 +10,7 @@ import uuid
 import hashlib
 import websockets
 
+from typing import Optional
 from pathlib import Path
 from protocols import *
 from crypto import  RSAKeys, rsa_encrypt, rsa_decrypt, rsa_chunk_iter
@@ -44,7 +45,7 @@ class SOCPClient:
         self.downloads: dict[str, bytearray] = {}
         self.keyring: dict[str,str] = {self.user_uuid: self.keys.pub_der_b64u()}
         self.recv_files: dict[str, dict] = {}       # file_id -> {"fh": f, "path": Path, "mode": str, "group_id": str|None}
-        self.ws: websockets.WebSocketClientProtocol | None = None
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self._send_lock = asyncio.Lock()
         self.public_members: set[str] = set()
 
@@ -177,12 +178,11 @@ class SOCPClient:
         """
 
         assert self.ws
-        loop = asyncio.get_event_loop()
         print("/help for commands")
 
         while self.ws and self.ws.open:
             try:
-                line = await loop.run_in_executor(None, input)
+                line = await asyncio.to_thread(input)
             except Exception:
                 await asyncio.sleep(0.2)
                 continue
