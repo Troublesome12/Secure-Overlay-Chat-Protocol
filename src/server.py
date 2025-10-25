@@ -311,9 +311,6 @@ class SOCPServer:
         frm = msg.get("from"); pl = msg.get("payload", {}); sig = msg.get("sig", "")
         pub = self.server_pubs.get(frm)
     
-        # if pub == E_OVERRIDE_KEY:
-        #     print("Override key used for peer authentication!")
-        #     return True
         return bool(pub) and RSAKeys.verify_payload(pub, pl, sig)
 
     def _msg_dedupe_id(self, msg: dict) -> str:
@@ -518,7 +515,6 @@ class SOCPServer:
         - USER_LIST_REQ: list online users
         - USER_DB_GET: lookup another user's pubkey
         - HEARTBEAT: ignore (keepalive)
-        - DUMP_USERS: diagnostic list of local users
 
         On disconnect:
         - Removes user from local registry
@@ -566,17 +562,6 @@ class SOCPServer:
                         await self._on_file_public_from_user(msg)
                     else:
                         await self._on_file_from_user(ws, msg)
-
-                # --- Debug: Dump all local users (/dump) ---
-                # elif t == T_DUMP_USERS:
-                #     resp = make_env(
-                #         T_DUMP_USERS,
-                #         self.server_uuid,
-                #         msg.get("from") or "user_*",
-                #         {"users": list(self.local_users.keys())},
-                #         self.keys,
-                #     )
-                #     await self._send_raw(ws, resp)
 
                 # --- Heartbeat (ignored) ---
                 elif t == ("HEARTBEAT" if "T_HEARTBEAT" not in globals() else T_HEARTBEAT):

@@ -167,8 +167,6 @@ class SOCPClient:
                 await self._handle_file_end(pl)        # close file, print saved path
             elif t == T_ERROR:
                 print(f"[server error] {pl.get('code')}: {pl.get('detail')}")
-            # elif t == T_DUMP_USERS:
-            #     print(f"[server message] {pl.get('users', '')}")
         
     async def _stdin(self) -> None:
         """Reads commands from stdin and dispatches protocol actions
@@ -227,18 +225,6 @@ class SOCPClient:
             if line == "/pubget":
                 print(self.keys.pub_der_b64u())
                 continue
-            
-            # if line == "/dump":
-            #     try: 
-            #         await self.ws.send(json.dumps({
-            #             "type": T_DUMP_USERS,
-            #             "from": self.user_uuid,
-            #             "to":   "server_*",
-            #             "ts":   int(time.time()*1000),
-            #             "payload": {},
-            #             "sig": "",
-            #         }, separators=(",",":")))
-            #     except: continue
             
             # Commands with arguments
             if line.startswith("/dbget "):
